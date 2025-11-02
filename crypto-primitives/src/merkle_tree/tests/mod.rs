@@ -2,9 +2,6 @@
 mod constraints;
 mod test_utils;
 
-// TODO: add duplicate and OOB index handling (defensive checks) 
-// and size/structure sanity checks 
-
 mod bytes_mt_tests {
 
     use crate::{crh::*, merkle_tree::*};
@@ -298,6 +295,61 @@ mod field_mt_tests {
         assert!(multi_proof
             .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
             .unwrap());
+    }
+
+    #[test]
+    fn multiproof_prefix_encoding_sanity() {
+        use ark_std::collections::BTreeSet;
+
+        let leaves: Vec<Vec<_>> = (0..32u64).map(|i| vec![F::from(i)]).collect();
+        let leaf_crh_params = poseidon_parameters();
+        let two_to_one_params = leaf_crh_params.clone();
+        let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
+
+        let query_indexes = vec![9usize, 0, 12, 5, 3, 3, 17, 24, 31, 0];
+        let multi_proof = tree
+            .generate_multi_proof(query_indexes.clone())
+            .unwrap();
+
+        let sorted_unique: Vec<_> = query_indexes
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let mut prev_path: Vec<F> = Vec::new();
+        let mut expected_prefix_lengths = Vec::new();
+        let mut expected_suffixes: Vec<Vec<F>> = Vec::new();
+        let mut expected_suffix_total = 0usize;
+
+        for &index in &sorted_unique {
+            let path = tree.generate_proof(index).unwrap().auth_path;
+            let prefix_len = prev_path
+                .iter()
+                .zip(path.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let suffix = path[prefix_len..].to_vec();
+            expected_suffix_total += suffix.len();
+            expected_prefix_lengths.push(prefix_len);
+            expected_suffixes.push(suffix);
+            prev_path = path;
+        }
+
+        let actual_suffix_total: usize = multi_proof
+            .auth_paths_suffixes
+            .iter()
+            .map(|suffix| suffix.len())
+            .sum();
+
+        assert_eq!(multi_proof.leaf_indexes, sorted_unique);
+        assert_eq!(multi_proof.auth_paths_prefix_lenghts, expected_prefix_lengths);
+        assert_eq!(multi_proof.auth_paths_suffixes, expected_suffixes);
+        assert_eq!(multi_proof.leaf_siblings_hashes.len(), sorted_unique.len());
+        assert_eq!(
+            multi_proof.leaf_siblings_hashes.len() + actual_suffix_total,
+            sorted_unique.len() + expected_suffix_total
+        );
     }
 
     #[test]
