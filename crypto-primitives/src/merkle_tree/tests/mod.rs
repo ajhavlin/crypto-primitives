@@ -2,11 +2,15 @@
 mod constraints;
 mod test_utils;
 
+// TODO: add duplicate and OOB index handling (defensive checks) 
+// and size/structure sanity checks 
+
 mod bytes_mt_tests {
 
     use crate::{crh::*, merkle_tree::*};
     use ark_ed_on_bls12_381::EdwardsProjective as JubJub;
     use ark_ff::BigInteger256;
+    use ark_serialize::CanonicalSerialize;
     use ark_std::{iter::zip, test_rng, UniformRand};
 
     #[derive(Clone)]
@@ -33,13 +37,17 @@ mod bytes_mt_tests {
     }
     type JubJubMerkleTree = MerkleTree<JubJubMerkleTreeParams>;
 
-    /// Pedersen only takes bytes as leaf, so we use `ToBytes` trait.
+    /// Pedersen only takes bytes as leaf, so we serialise leaves canonically into bytes.
     fn merkle_tree_test<L: CanonicalSerialize>(leaves: &[L], update_query: &[(usize, L)]) -> () {
         let mut rng = ark_std::test_rng();
 
-        let mut leaves: Vec<_> = leaves
+        let mut leaves: Vec<Vec<u8>> = leaves
             .iter()
-            .map(|leaf| crate::to_uncompressed_bytes!(leaf).unwrap())
+            .map(|leaf| {
+                let mut bytes = Vec::new();
+                leaf.serialize_uncompressed(&mut bytes).unwrap();
+                bytes
+            })
             .collect();
 
         let leaf_crh_params = <LeafH as CRHScheme>::setup(&mut rng).unwrap();
@@ -68,9 +76,10 @@ mod bytes_mt_tests {
 
         // test merkle tree update functionality
         for (i, v) in update_query {
-            let v = crate::to_uncompressed_bytes!(v).unwrap();
-            tree.update(*i, &v).unwrap();
-            leaves[*i] = v.clone();
+            let mut bytes = Vec::new();
+            v.serialize_uncompressed(&mut bytes).unwrap();
+            tree.update(*i, &bytes).unwrap();
+            leaves[*i] = bytes.clone();
         }
         // update the root
         root = tree.root();
@@ -140,9 +149,13 @@ mod bytes_mt_tests {
         }
         assert_eq!(leaves.len(), 8);
 
-        let serialized_leaves: Vec<_> = leaves
+        let serialized_leaves: Vec<Vec<u8>> = leaves
             .iter()
-            .map(|leaf| crate::to_uncompressed_bytes!(leaf).unwrap())
+            .map(|leaf| {
+                let mut bytes = Vec::new();
+                leaf.serialize_uncompressed(&mut bytes).unwrap();
+                bytes
+            })
             .collect();
 
         let leaf_crh_params = <LeafH as CRHScheme>::setup(&mut rng).unwrap();
