@@ -432,8 +432,6 @@ impl<P: Config> MultiPathV2<P> {
     ) -> Result<bool, crate::Error> {
         // TODO: when multi-proof logic is overhauled, clarify the semantics for empty
         //       batches (this index access panics if `leaf_indexes` is empty)
-        use log::{debug, trace};
-
         let have_coset = 
             self.tree_height >= 2 && 
             (!self.leaf_indexes.is_empty() // accept valid batch of size 0 proof without path work
@@ -443,8 +441,6 @@ impl<P: Config> MultiPathV2<P> {
         if have_coset {
             let d = self.tree_height;
             let leaf_depth = d - 1;
-            debug!("coset.verify: k={}, height={}", self.leaf_indexes.len(), d);
-
             if d < 2 {
                 return Ok(false);
             }
@@ -453,12 +449,12 @@ impl<P: Config> MultiPathV2<P> {
             let mut leaves = leaves.into_iter();
             let mut leaf_level: BTreeMap<usize, P::LeafDigest> = BTreeMap::new(); 
             for &idx in &self.leaf_indexes {
-                let leaf = leaves.next().ok_or_else(|| crate::Error::Other("coset.verify: insufficient leaves".into()))?;
+                let leaf = leaves.next().ok_or_else(|| crate::Error::IncorrectInputLength(self.leaf_indexes.len()))?;
                 let leaf_hash = P::LeafHash::evaluate(leaf_hash_params, leaf.borrow())?;
                 leaf_level.insert(idx, leaf_hash);
             }
             if leaves.next().is_some() {
-                return Err(crate::Error::Other("coset.verify: extra leaves".into()));
+                return Err(crate::Error::IncorrectInputLength(self.leaf_indexes.len()));
             }
 
             // Compute on-path sets A_j and reconstruct expected B*_j = siblings(A_j) \ A_j
@@ -552,7 +548,6 @@ impl<P: Config> MultiPathV2<P> {
             // check root
             match inner_levels[0].get(&0) {
                 Some(h) => {
-                    trace!("coset.verify: root computed, success={}", h == root_hash);
                     Ok(h == root_hash)
                 }
                 None => Ok(false),
@@ -943,21 +938,17 @@ impl<P: Config> MerkleTree<P> {
     /// Notes:
     /// * Empty input (`indexes` is empty) returns a structurally valid empty proof carrying `tree_height`,
     ///   and verification succeeds vacuously against the claimed root.
-    pub fn generate_multi_proof_V2(
+    pub fn generate_multi_proof_v2(
         &self,
         indexes: impl IntoIterator<Item = usize>,
     ) -> Result<MultiPathV2<P>, crate::Error> {
-        // TODO: remove logging and debugging for production
-        use log::{debug, trace};
-
         // pruned and sorted for encoding efficiency
         let indexes: BTreeSet<usize> = indexes.into_iter().collect();
         let d = self.height();
-        debug!("coset.generate_multi_proof: k={}, height={}", indexes.len(), d);
 
         // TODO: should empty query return structurally valid empty proof
         if indexes.is_empty() {
-            return Ok(MultiPathv2 {
+            return Ok(MultiPathV2 {
                 tree_height: d,
                 leaf_indexes: Vec::new(),
                 leaf_copath: Vec::new(),
@@ -970,7 +961,7 @@ impl<P: Config> MerkleTree<P> {
         }
 
         // legacy       
-        let mut auth_path_prefix_lengths = Vec::with_capacity(indexes.len());
+        let mut auth_paths_prefix_lenghts = Vec::with_capacity(indexes.len());
         let mut auth_paths_suffixes: Vec<Vec<P::InnerDigest>> = Vec::with_capacity(indexes.len());
        
         let mut leaf_siblings_hashes = Vec::with_capacity(indexes.len());
@@ -1041,8 +1032,7 @@ impl<P: Config> MerkleTree<P> {
             if let Some(sibling_digest) = leaf_candidates.get(&(leaf_depth, sibling_idx)) {
                 leaf_copath.push(sibling_digest.clone());
             } else {
-                // This should not happen; fallback to computing from stored leaves if needed
-                return Err(crate::Error::Other("coset: missing leaf copath candidate".into()));
+                return Err(crate::Error::IncorrectInputLength(self.leaf_nodes.len()));
             }
         }
 
@@ -1055,7 +1045,7 @@ impl<P: Config> MerkleTree<P> {
                     if let Some(sibling_digest) = inner_candidates.get(&(depth, sibling_idx)) {
                         inner_copath.push((depth, sibling_idx, sibling_digest.clone()));
                     } else {
-                        return Err(crate::Error::Other("coset: missing inner copath candidate".into()));
+                        return Err(crate::Error::IncorrectInputLength(self.leaf_nodes.len()));
                     }
                 }
             }
@@ -1064,12 +1054,6 @@ impl<P: Config> MerkleTree<P> {
         inner_copath.sort_by_key(|(dpt, idx, _)| (*dpt, *idx));
 
         // TODO: later remove trace
-        trace!(
-            "coset.generate_multi_proof: leaf_copath={}, inner_copath={}",
-            leaf_copath.len(),
-            inner_copath.len()
-        );
-
         Ok(MultiPathV2 {
             tree_height: d,
             leaf_indexes: Vec::from_iter(indexes),

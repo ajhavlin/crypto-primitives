@@ -67,7 +67,14 @@ mod bytes_mt_tests {
             .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
             .unwrap();
 
+        let mut coset_multi_proof = tree
+            .generate_multi_proof_v2((0..leaves.len()).collect::<Vec<_>>())
+            .unwrap();
+
         assert!(multi_proof
+            .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
+            .unwrap());
+        assert!(coset_multi_proof
             .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
             .unwrap());
 
@@ -92,8 +99,14 @@ mod bytes_mt_tests {
         multi_proof = tree
             .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
             .unwrap();
+        coset_multi_proof = tree
+            .generate_multi_proof_v2((0..leaves.len()).collect::<Vec<_>>())
+            .unwrap();
 
         assert!(multi_proof
+            .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
+            .unwrap());
+        assert!(coset_multi_proof
             .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
             .unwrap());
     }
@@ -171,6 +184,10 @@ mod bytes_mt_tests {
             .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
             .unwrap();
 
+        let coset_multi_proof = tree
+            .generate_multi_proof_v2((0..leaves.len()).collect::<Vec<_>>())
+            .unwrap();
+
         // test compression theretical prefix lengths for size 8 Tree:
         // we should send 6 hashes instead of 2*8 = 16
         let theoretical_prefix_lengths = vec![0, 2, 1, 2, 0, 2, 1, 2];
@@ -189,6 +206,15 @@ mod bytes_mt_tests {
         ) {
             assert_eq!(prefix_len + suffix.len(), proofs[0].auth_path.len());
         }
+
+        assert!(coset_multi_proof
+            .verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &tree.root(),
+                serialized_leaves.clone()
+            )
+            .unwrap());
     }
 }
 
