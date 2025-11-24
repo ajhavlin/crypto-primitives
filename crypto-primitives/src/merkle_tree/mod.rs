@@ -25,6 +25,9 @@ pub mod constraints;
 #[cfg(test)]
 mod tests;
 
+pub mod v2_bench;
+pub use v2_bench::MultiPathV2Bench;
+
 #[cfg(all(
     target_has_atomic = "8",
     target_has_atomic = "16",
@@ -42,6 +45,8 @@ type DefaultHasher = ahash::AHasher;
     target_has_atomic = "ptr"
 )))]
 type DefaultHasher = fnv::FnvHasher;
+
+type PackedInnerCopath<P> = (usize, usize, Vec<u8>, Vec<<P as Config>::InnerDigest>);
 
 /// Convert the hash digest in different layers by converting previous layer's output to
 /// `TargetType`, which is a `Borrow` to next layer's input.
@@ -405,16 +410,53 @@ pub struct MultiPathV2<P: Config> {
     pub leaf_indexes: Vec<usize>,
     /// For leaf layer, stores co-path digests (B*_{d-1}) in ascending sibling index order
     pub leaf_copath: Vec<P::LeafDigest>,
-    /// For inner layers, stores co-path entries as (depth, index, digest) tuples ordered by (depth, index)
-    pub inner_copath: Vec<(usize, usize, P::InnerDigest)>,
+    /// For inner layers, stores co-path entries packed as (start_depth, start_index, packed deltas, digests)
+    pub inner_copath: Option<PackedInnerCopath<P>>,
     
     /// ---- Legacy fields (kept for compatibility/tests) ----
+    /// These vectors are left empty
     /// For node i, stores the hash of node i's sibling
     pub leaf_siblings_hashes: Vec<P::LeafDigest>,
     /// For node i path, stores at index i the prefix length of the path, for Incremental encoding
     pub auth_paths_prefix_lenghts: Vec<usize>,
     /// For node i path, stores at index i the suffix of the path for Incremental Encoding (as vector of symbols to be resolved with self.lut). Order is from higher layer to lower layer (does not include root node).
     pub auth_paths_suffixes: Vec<Vec<P::InnerDigest>>,
+}
+
+#[allow(dead_code)]
+struct CoSetLevel<P: Config> {
+    entries: Vec<(usize, P::InnerDigest)>,
+}
+
+impl<P: Config> CoSetLevel<P> {
+    #[allow(dead_code)]
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    #[allow(dead_code)]
+    fn get(&self, idx: usize) -> Option<&P::InnerDigest> {
+        self.entries.iter().find(|(i, _)| *i == idx).map(|(_, d)| d)
+    }
+
+    #[allow(dead_code)]
+    fn insert_or_check(&mut self, idx: usize, digest: &P::InnerDigest) -> bool {
+        if let Some((_, existing)) = self.entries.iter().find(|(i, _)| *i == idx) {
+            existing == digest
+        } else {
+            self.entries.push((idx, digest.clone()));
+            true
+        }
+    }
+
+    #[allow(dead_code)]
+    fn set(&mut self, idx: usize, digest: P::InnerDigest) {
+        if let Some((_, existing)) = self.entries.iter_mut().find(|(i, _)| *i == idx) {
+            *existing = digest;
+        } else {
+            self.entries.push((idx, digest));
+        }
+    }
 }
 
 impl<P: Config> MultiPathV2<P> {
@@ -432,10 +474,10 @@ impl<P: Config> MultiPathV2<P> {
     ) -> Result<bool, crate::Error> {
         // TODO: when multi-proof logic is overhauled, clarify the semantics for empty
         //       batches (this index access panics if `leaf_indexes` is empty)
-        let have_coset = 
-            self.tree_height >= 2 && 
+        let have_coset =
+            self.tree_height >= 2 &&
             (!self.leaf_indexes.is_empty() // accept valid batch of size 0 proof without path work
-             || !self.inner_copath.is_empty() 
+             || self.inner_copath.is_some()
              || !self.leaf_copath.is_empty());
 
         if have_coset {
@@ -465,7 +507,7 @@ impl<P: Config> MultiPathV2<P> {
             let mut expected_leaf_coset: Vec<usize> = Vec::new();
             for &path_idx in on_path[leaf_depth].iter() {
                 let sibling_idx = path_idx ^ 1;
-                if !on_path[leaf_depth].contains(&sibling_idx) {
+                if !contains_sorted(&on_path[leaf_depth], sibling_idx) {
                     expected_leaf_coset.push(sibling_idx); // copath element needed for proof
                 }
             }
@@ -492,21 +534,86 @@ impl<P: Config> MultiPathV2<P> {
             let mut hash_lut: HashMap<usize, P::InnerDigest, _> =
                 HashMap::with_hasher(BuildHasherDefault::<DefaultHasher>::default());
 
-            for &(depth, idx, ref copath_digest) in &self.inner_copath {
-                if depth == 0 || depth >= d {
-                    return Ok(false);
-                }
-                // store the sibling digest at its depth/index
-                if let Some(existing) = inner_levels[depth].get(&idx) {
-                    if existing != copath_digest {
+            if let Some((start_depth, start_index, deltas, digests)) = &self.inner_copath {
+                if digests.is_empty() {
+                    if !deltas.is_empty() {
                         return Ok(false);
                     }
                 } else {
-                    inner_levels[depth].insert(idx, copath_digest.clone());
+                    let mut depth = match i64::try_from(*start_depth) {
+                        Ok(value) => value,
+                        Err(_) => return Ok(false),
+                    };
+                    let mut index = match i64::try_from(*start_index) {
+                        Ok(value) => value,
+                        Err(_) => return Ok(false),
+                    };
+                    let mut cursor = 0usize;
+                    let mut prev_coord: Option<(usize, usize)> = None;
+                    let mut push_entry = |depth_i64: i64,
+                                          index_i64: i64,
+                                          digest: &P::InnerDigest|
+                     -> bool {
+                        let depth_usize = match usize::try_from(depth_i64) {
+                            Ok(v) => v,
+                            Err(_) => return false,
+                        };
+                        let index_usize = match usize::try_from(index_i64) {
+                            Ok(v) => v,
+                            Err(_) => return false,
+                        };
+                        if depth_usize == 0 || depth_usize >= d {
+                            return false;
+                        }
+                        if let Some((pd, pi)) = prev_coord {
+                            if (depth_usize, index_usize) < (pd, pi) {
+                                return false;
+                            }
+                        }
+                        if let Some(existing) = inner_levels[depth_usize].get(&index_usize) {
+                            if existing != digest {
+                                return false;
+                            }
+                        } else {
+                            inner_levels[depth_usize].insert(index_usize, digest.clone());
+                        }
+                        // seed LUT with known siblings
+                        let heap_idx = level_index(depth_usize, index_usize);
+                        hash_lut.entry(heap_idx).or_insert_with(|| digest.clone());
+                        prev_coord = Some((depth_usize, index_usize));
+                        true
+                    };
+
+                    if !push_entry(depth, index, &digests[0]) {
+                        return Ok(false);
+                    }
+
+                    for digest in digests.iter().skip(1) {
+                        let depth_delta = match decode_delta(deltas, &mut cursor) {
+                            Some(delta) => delta,
+                            None => return Ok(false),
+                        };
+                        let index_delta = match decode_delta(deltas, &mut cursor) {
+                            Some(delta) => delta,
+                            None => return Ok(false),
+                        };
+                        depth = match depth.checked_add(depth_delta) {
+                            Some(value) => value,
+                            None => return Ok(false),
+                        };
+                        index = match index.checked_add(index_delta) {
+                            Some(value) => value,
+                            None => return Ok(false),
+                        };
+                        if !push_entry(depth, index, digest) {
+                            return Ok(false);
+                        }
+                    }
+
+                    if cursor != deltas.len() {
+                        return Ok(false);
+                    }
                 }
-                // seed LUT with known siblings
-                let heap_idx = level_index(depth, idx);
-                hash_lut.entry(heap_idx).or_insert_with(|| copath_digest.clone());
             }
 
             // Recomputation
@@ -915,7 +1022,8 @@ impl<P: Config> MerkleTree<P> {
 
     /// Returns a MultiPathV2 (a compressed membership proof for a set of leaves), 
     /// sufficient to verify each leaf up to the root.
-    /// Note that for compatibility, indexes are internally sorted and legacy prefix fields still populated.
+    /// Note that for compatibility, indexes are internally sorted and legacy prefix fields remain in the
+    /// struct (but are emitted empty for new proofs)
     /// 
     /// With the CoSet (minimal co-path) encoding, we do not store full per-leaf authentication paths.
     /// Instead we collect, for each tree level, only those siblings of on-path nodes that are not themselves on-path. 
@@ -960,80 +1068,27 @@ impl<P: Config> MerkleTree<P> {
             });
         }
 
-        // legacy       
-        let mut auth_paths_prefix_lenghts = Vec::with_capacity(indexes.len());
-        let mut auth_paths_suffixes: Vec<Vec<P::InnerDigest>> = Vec::with_capacity(indexes.len());
-       
-        let mut leaf_siblings_hashes = Vec::with_capacity(indexes.len());
-        
-        let mut prev_path = Vec::new();
-        // end of legacy
-
         let leaf_depth = d - 1;
-        let mut leaf_candidates: BTreeMap<(usize /*depth*/, usize /*idx*/), P::LeafDigest> =
-            BTreeMap::new();
-        let mut inner_candidates: BTreeMap<(usize /*depth*/, usize /*idx*/), P::InnerDigest> =
-            BTreeMap::new();
-
-        // TODO: loop over index in &indexes with ref to *index 
-        // or switch to &i in indexes.iter() with ref to i and promise ?
-        for &i in indexes.iter() {
-            let path = self.generate_proof(i)?;
-            
-            // Legacy prefix-encoding (for compatibility)
-            let prefix_len = {
-                let l = prev_path
-                    .iter()
-                    .zip(path.auth_path.iter())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                l
-            };
-            let suffix = path.auth_path[prefix_len..].to_vec();
-            auth_paths_prefix_lenghts.push(prefix_len);
-            auth_paths_suffixes.push(suffix);
-            prev_path = path.auth_path.clone();
-
-            leaf_siblings_hashes.push(path.leaf_sibling_hash.clone());
-            // end of legacy
-
-            // CoSet candidates at leaf layer: sibling at depth d-1 is i xor 1
-            let sib_leaf_idx = i ^ 1;
-            leaf_candidates
-                .entry((leaf_depth, sib_leaf_idx))
-                .or_insert(path.leaf_sibling_hash);
-
-            // CoSet candidates on inner layers
-            for (offset, digest) in path.auth_path.into_iter().enumerate() {
-                let depth = offset + 1; // inner depths are 1..(d-2)
-                let shift = leaf_depth - depth;
-                let on_path_index = if shift == 0 { i } else { i >> shift };
-                let sibling_index = on_path_index ^ 1;
-                inner_candidates
-                    .entry((depth, sibling_index))
-                    .or_insert(digest);
-            }
-        }
-
         // Compute on-path sets A_j and then minimal co-path B*_j = siblings(A_j) \ A_j
         let on_path = compute_on_path(leaf_depth, &indexes);
 
         // leaf layer (depth = d-1)
-        let mut leaf_coset_ids: BTreeSet<usize> = BTreeSet::new();
+        let mut leaf_coset_ids: Vec<usize> = Vec::new();
         for &path_idx in on_path[leaf_depth].iter() {
             let sibling_idx = path_idx ^ 1;
-            if !on_path[leaf_depth].contains(&sibling_idx) {
-                leaf_coset_ids.insert(sibling_idx);
+            if !contains_sorted(&on_path[leaf_depth], sibling_idx) {
+                leaf_coset_ids.push(sibling_idx);
             }
         }
+        leaf_coset_ids.sort_unstable();
 
         let mut leaf_copath = Vec::with_capacity(leaf_coset_ids.len());
         for sibling_idx in leaf_coset_ids.iter().copied() {
-            if let Some(sibling_digest) = leaf_candidates.get(&(leaf_depth, sibling_idx)) {
-                leaf_copath.push(sibling_digest.clone());
-            } else {
-                return Err(crate::Error::IncorrectInputLength(self.leaf_nodes.len()));
-            }
+            let sibling_digest = self
+                .leaf_nodes
+                .get(sibling_idx)
+                .ok_or_else(|| crate::Error::IncorrectInputLength(self.leaf_nodes.len()))?;
+            leaf_copath.push(sibling_digest.clone());
         }
 
         // inner layers (depth 1..d-2)
@@ -1041,12 +1096,13 @@ impl<P: Config> MerkleTree<P> {
         for depth in 1..leaf_depth {
             for &path_idx in on_path[depth].iter() {
                 let sibling_idx = path_idx ^ 1;
-                if !on_path[depth].contains(&sibling_idx) {
-                    if let Some(sibling_digest) = inner_candidates.get(&(depth, sibling_idx)) {
-                        inner_copath.push((depth, sibling_idx, sibling_digest.clone()));
-                    } else {
-                        return Err(crate::Error::IncorrectInputLength(self.leaf_nodes.len()));
-                    }
+                if !contains_sorted(&on_path[depth], sibling_idx) {
+                    let heap_idx = level_index(depth, sibling_idx);
+                    let sibling_digest = self
+                        .non_leaf_nodes
+                        .get(heap_idx)
+                        .ok_or_else(|| crate::Error::IncorrectInputLength(self.non_leaf_nodes.len()))?;
+                    inner_copath.push((depth, sibling_idx, sibling_digest.clone()));
                 }
             }
         }
@@ -1059,10 +1115,10 @@ impl<P: Config> MerkleTree<P> {
             leaf_indexes: Vec::from_iter(indexes),
             leaf_copath,
             inner_copath,
-            // legacy fields still populated for tests
-            leaf_siblings_hashes,
-            auth_paths_prefix_lenghts,
-            auth_paths_suffixes,
+            // legacy prefix data intentionally omitted for compact proofs
+            leaf_siblings_hashes: Vec::new(),
+            auth_paths_prefix_lenghts: Vec::new(),
+            auth_paths_suffixes: Vec::new(),
         })
     }
 
@@ -1264,19 +1320,41 @@ where
     }
 }
 
+
 /// Build the on-path sets A_j from the (sorted, unique) leaf index set I and the leaf depth `d-1`.
 /// A_j contains 0-based indices at depth j that lie on the union of all single paths from I to the root.
-fn compute_on_path(depth_leaves: usize, indexes: &ark_std::collections::BTreeSet<usize>)
-    -> Vec<ark_std::collections::BTreeSet<usize>>
-{
-    use ark_std::collections::BTreeSet;
-    let mut path_sets = vec![BTreeSet::new(); depth_leaves + 1];
-    for &leaf_index in indexes.iter() {
-        for depth in 0..=depth_leaves {
-            let shift = depth_leaves - depth;
-            let path_index = if shift == 0 { leaf_index } else { leaf_index >> shift };
-            path_sets[depth].insert(path_index);
+/// 
+/// Implementation detail:
+/// * Uses sorted `Vec<usize>` per level to keep the hot loops linear and cache-friendly.
+/// * Each leaf contributes one index per depth; we divide by 2 as we walk up and then sort+dedup.
+fn compute_on_path(
+    depth_leaves: usize,
+    indexes: &ark_std::collections::BTreeSet<usize>,
+) -> Vec<Vec<usize>> {
+    // collect raw indices per depth
+    let mut path_sets: Vec<Vec<usize>> = vec![Vec::new(); depth_leaves + 1];
+    for &leaf_index in indexes {
+        let mut idx = leaf_index;
+        let mut depth = depth_leaves;
+        loop {
+            path_sets[depth].push(idx);
+            if depth == 0 {
+                break;
+            }
+            idx >>= 1;
+            depth -= 1;
         }
     }
+
+    // sort + dedup each level to get canonical, unique, ascending order
+    for level in 0..=depth_leaves {
+        let level_vec = &mut path_sets[level];
+        level_vec.sort_unstable();
+        level_vec.dedup();
+    }
     path_sets
+}
+
+fn contains_sorted(haystack: &[usize], needle: usize) -> bool {
+    haystack.binary_search(&needle).is_ok()
 }

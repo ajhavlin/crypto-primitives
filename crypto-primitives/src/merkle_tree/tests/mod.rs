@@ -2,6 +2,8 @@
 mod constraints;
 mod test_utils;
 
+mod bench_report;
+
 mod bytes_mt_tests {
 
     use crate::{crh::*, merkle_tree::*};

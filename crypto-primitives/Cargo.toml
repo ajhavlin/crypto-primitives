@@ -74,6 +74,7 @@ ark-bls12-381 = { git = "https://github.com/arkworks-rs/algebra", default-featur
 ark-mnt4-298 = { git = "https://github.com/arkworks-rs/algebra", default-features = false, features = [ "curve", "r1cs" ] }
 ark-mnt6-298 = { git = "https://github.com/arkworks-rs/algebra", default-features = false, features = [ "r1cs" ] }
 criterion = { version = "0.6" }
+plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series", "ttf"] }
 
 ################################# Benchmarks ##################################
 
