@@ -2,6 +2,7 @@
 mod constraints;
 mod test_utils;
 
+#[cfg(all(test, feature = "bench_harness"))]
 mod bench_report;
 
 mod bytes_mt_tests {
@@ -10,7 +11,7 @@ mod bytes_mt_tests {
     use ark_ed_on_bls12_381::EdwardsProjective as JubJub;
     use ark_ff::BigInteger256;
     use ark_serialize::CanonicalSerialize;
-    use ark_std::{iter::zip, test_rng, UniformRand};
+    use ark_std::{test_rng, UniformRand};
 
     #[derive(Clone)]
     pub(super) struct Window4x256;
@@ -42,11 +43,7 @@ mod bytes_mt_tests {
 
         let mut leaves: Vec<Vec<u8>> = leaves
             .iter()
-            .map(|leaf| {
-                let mut bytes = Vec::new();
-                leaf.serialize_uncompressed(&mut bytes).unwrap();
-                bytes
-            })
+            .map(|leaf| crate::to_uncompressed_bytes!(leaf).unwrap())
             .collect();
 
         let leaf_crh_params = <LeafH as CRHScheme>::setup(&mut rng).unwrap();
@@ -69,21 +66,13 @@ mod bytes_mt_tests {
             .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
             .unwrap();
 
-        let mut coset_multi_proof = tree
-            .generate_multi_proof_v2((0..leaves.len()).collect::<Vec<_>>())
-            .unwrap();
-
         assert!(multi_proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
-            .unwrap());
-        assert!(coset_multi_proof
             .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
             .unwrap());
 
         // test merkle tree update functionality
         for (i, v) in update_query {
-            let mut bytes = Vec::new();
-            v.serialize_uncompressed(&mut bytes).unwrap();
+            let bytes = crate::to_uncompressed_bytes!(v).unwrap();
             tree.update(*i, &bytes).unwrap();
             leaves[*i] = bytes.clone();
         }
@@ -101,14 +90,8 @@ mod bytes_mt_tests {
         multi_proof = tree
             .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
             .unwrap();
-        coset_multi_proof = tree
-            .generate_multi_proof_v2((0..leaves.len()).collect::<Vec<_>>())
-            .unwrap();
 
         assert!(multi_proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
-            .unwrap());
-        assert!(coset_multi_proof
             .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
             .unwrap());
     }
@@ -163,11 +146,7 @@ mod bytes_mt_tests {
 
         let serialized_leaves: Vec<Vec<u8>> = leaves
             .iter()
-            .map(|leaf| {
-                let mut bytes = Vec::new();
-                leaf.serialize_uncompressed(&mut bytes).unwrap();
-                bytes
-            })
+            .map(|leaf| crate::to_uncompressed_bytes!(leaf).unwrap())
             .collect();
 
         let leaf_crh_params = <LeafH as CRHScheme>::setup(&mut rng).unwrap();
@@ -186,30 +165,8 @@ mod bytes_mt_tests {
             .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
             .unwrap();
 
-        let coset_multi_proof = tree
-            .generate_multi_proof_v2((0..leaves.len()).collect::<Vec<_>>())
-            .unwrap();
-
-        // test compression theretical prefix lengths for size 8 Tree:
-        // we should send 6 hashes instead of 2*8 = 16
-        let theoretical_prefix_lengths = vec![0, 2, 1, 2, 0, 2, 1, 2];
-
-        for (comp_len, exp_len) in zip(
-            &multi_proof.auth_paths_prefix_lenghts,
-            &theoretical_prefix_lengths,
-        ) {
-            assert_eq!(comp_len, exp_len);
-        }
-
-        // test that the compressed paths can expand to expected len
-        for (prefix_len, suffix) in zip(
-            &multi_proof.auth_paths_prefix_lenghts,
-            &multi_proof.auth_paths_suffixes,
-        ) {
-            assert_eq!(prefix_len + suffix.len(), proofs[0].auth_path.len());
-        }
-
-        assert!(coset_multi_proof
+        // multi-proof should verify and contain co-set data consistent with expected on-path sets
+        assert!(multi_proof
             .verify(
                 &leaf_crh_params,
                 &two_to_one_params,
@@ -227,7 +184,7 @@ mod field_mt_tests {
             tests::test_utils::poseidon_parameters, Config, IdentityDigestConverter, MerkleTree,
         },
     };
-    use ark_std::{test_rng, One, UniformRand};
+    use ark_std::{test_rng, UniformRand, One};
 
     type F = ark_ed_on_bls12_381::Fr;
     type H = poseidon::CRH<F>;
@@ -326,61 +283,6 @@ mod field_mt_tests {
     }
 
     #[test]
-    fn multiproof_prefix_encoding_sanity() {
-        use ark_std::collections::BTreeSet;
-
-        let leaves: Vec<Vec<_>> = (0..32u64).map(|i| vec![F::from(i)]).collect();
-        let leaf_crh_params = poseidon_parameters();
-        let two_to_one_params = leaf_crh_params.clone();
-        let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
-
-        let query_indexes = vec![9usize, 0, 12, 5, 3, 3, 17, 24, 31, 0];
-        let multi_proof = tree
-            .generate_multi_proof(query_indexes.clone())
-            .unwrap();
-
-        let sorted_unique: Vec<_> = query_indexes
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-
-        let mut prev_path: Vec<F> = Vec::new();
-        let mut expected_prefix_lengths = Vec::new();
-        let mut expected_suffixes: Vec<Vec<F>> = Vec::new();
-        let mut expected_suffix_total = 0usize;
-
-        for &index in &sorted_unique {
-            let path = tree.generate_proof(index).unwrap().auth_path;
-            let prefix_len = prev_path
-                .iter()
-                .zip(path.iter())
-                .take_while(|(a, b)| a == b)
-                .count();
-            let suffix = path[prefix_len..].to_vec();
-            expected_suffix_total += suffix.len();
-            expected_prefix_lengths.push(prefix_len);
-            expected_suffixes.push(suffix);
-            prev_path = path;
-        }
-
-        let actual_suffix_total: usize = multi_proof
-            .auth_paths_suffixes
-            .iter()
-            .map(|suffix| suffix.len())
-            .sum();
-
-        assert_eq!(multi_proof.leaf_indexes, sorted_unique);
-        assert_eq!(multi_proof.auth_paths_prefix_lenghts, expected_prefix_lengths);
-        assert_eq!(multi_proof.auth_paths_suffixes, expected_suffixes);
-        assert_eq!(multi_proof.leaf_siblings_hashes.len(), sorted_unique.len());
-        assert_eq!(
-            multi_proof.leaf_siblings_hashes.len() + actual_suffix_total,
-            sorted_unique.len() + expected_suffix_total
-        );
-    }
-
-    #[test]
     fn good_root_test() {
         let mut rng = test_rng();
         let mut rand_leaves = || (0..3).map(|_| F::rand(&mut rng)).collect();
@@ -400,4 +302,140 @@ mod field_mt_tests {
             ],
         )
     }
+
+    #[test]
+    fn multiproof_empty_batch_verifies() {
+        let mut rng = test_rng();
+        let leaves: Vec<Vec<_>> = (0..4).map(|_| (0..3).map(|_| F::rand(&mut rng)).collect()).collect();
+        let leaf_crh_params = poseidon_parameters();
+        let two_to_one_params = leaf_crh_params.clone();
+        let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
+        let root = tree.root();
+
+        let proof = tree.generate_multi_proof(Vec::<usize>::new()).unwrap();
+        assert!(
+            proof
+                .verify(&leaf_crh_params, &two_to_one_params, &root, Vec::<Vec<F>>::new())
+                .unwrap(),
+            "empty batch proof should verify"
+        );
+        assert_eq!(proof.leaf_indexes.len(), 0);
+    }
+
+    #[test]
+    fn multiproof_duplicate_indices_deduped() {
+        let mut rng = test_rng();
+        let leaves: Vec<Vec<_>> = (0..8).map(|_| (0..3).map(|_| F::rand(&mut rng)).collect()).collect();
+        let leaf_crh_params = poseidon_parameters();
+        let two_to_one_params = leaf_crh_params.clone();
+        let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
+        let root = tree.root();
+
+        let indexes = vec![3usize, 1, 3, 1, 5];
+        let proof = tree.generate_multi_proof(indexes.clone()).unwrap();
+        assert_eq!(proof.leaf_indexes, vec![1, 3, 5], "indexes should be sorted & deduped");
+
+        let opened: Vec<_> = proof
+            .leaf_indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
+
+        assert!(
+            proof
+                .verify(&leaf_crh_params, &two_to_one_params, &root, opened)
+                .unwrap(),
+            "proof with duplicate input indices should verify after deduplication"
+        );
+    }
+
+    #[test]
+    fn multiproof_wrong_leaf_copath_fails() {
+        let mut rng = test_rng();
+        let leaves: Vec<Vec<_>> = (0..8).map(|_| (0..3).map(|_| F::rand(&mut rng)).collect()).collect();
+        let leaf_crh_params = poseidon_parameters();
+        let two_to_one_params = leaf_crh_params.clone();
+        let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
+        let root = tree.root();
+
+        let proof = tree.generate_multi_proof(vec![1usize, 6]).unwrap();
+        let mut bad = proof.clone();
+        if let Some(first) = bad.leaf_copath.get_mut(0) {
+            *first += F::one(); // flip one sibling digest
+        }
+        let opened: Vec<_> = bad
+            .leaf_indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
+
+        let ok = bad
+            .verify(&leaf_crh_params, &two_to_one_params, &root, opened)
+            .unwrap();
+        assert!(!ok, "tampered leaf_copath digest must fail verification");
+    }
+
+    #[test]
+    fn multiproof_missing_inner_entry_fails() {
+        let mut rng = test_rng();
+        let leaves: Vec<Vec<_>> = (0..16).map(|_| (0..3).map(|_| F::rand(&mut rng)).collect()).collect();
+        let leaf_crh_params = poseidon_parameters();
+        let two_to_one_params = leaf_crh_params.clone();
+        let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
+        let root = tree.root();
+
+        let proof = tree.generate_multi_proof(vec![2usize, 5, 9]).unwrap();
+        let mut bad = proof.clone();
+        if let Some((_, _, _, digests)) = bad.inner_copath.as_mut() {
+            if !digests.is_empty() {
+                digests.pop(); // drop one inner sibling digest
+            }
+        }
+        let opened: Vec<_> = bad
+            .leaf_indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
+        let ok = bad
+            .verify(&leaf_crh_params, &two_to_one_params, &root, opened)
+            .unwrap();
+        assert!(!ok, "missing inner copath entry must invalidate the proof");
+    }
+
+    #[test]
+    fn multiproof_open_order_robustness() {
+        let mut rng = test_rng();
+        let leaves: Vec<Vec<_>> = (0..8).map(|_| (0..3).map(|_| F::rand(&mut rng)).collect()).collect();
+        let leaf_crh_params = poseidon_parameters();
+        let two_to_one_params = leaf_crh_params.clone();
+        let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
+        let root = tree.root();
+
+        let indexes = vec![4usize, 1, 6];
+        let proof = tree.generate_multi_proof(indexes.clone()).unwrap();
+
+        // verification should use leaves ordered by proof.leaf_indexes (sorted)
+        let ordered_leaves: Vec<_> = proof
+            .leaf_indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
+        assert!(
+            proof
+                .verify(&leaf_crh_params, &two_to_one_params, &root, ordered_leaves.clone())
+                .unwrap(),
+            "proof should verify when leaves follow proof.leaf_indexes order"
+        );
+
+        // providing leaves in shuffled query order should fail
+        let shuffled_leaves: Vec<_> = indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
+        let ok = proof
+            .verify(&leaf_crh_params, &two_to_one_params, &root, shuffled_leaves)
+            .unwrap();
+        assert!(!ok, "mismatched leaf ordering must fail verification");
+    }
+
 }

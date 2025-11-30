@@ -1,6 +1,8 @@
+#![cfg(feature = "bench_harness")]
+
 use crate::merkle_tree::{
-    tests::test_utils::poseidon_parameters, Config, IdentityDigestConverter, LeafParam,
-    MerkleTree, MultiPath, MultiPathV2, MultiPathV2Bench, Path as MerklePath, TwoToOneParam,
+    tests::test_utils::poseidon_parameters, CoPath, Config, IdentityDigestConverter, LeafParam,
+    MerkleTree, TwoToOneParam,
 };
 use ark_ed_on_bls12_381::Fr;
 use ark_serialize::CanonicalSerialize;
@@ -9,6 +11,10 @@ use ark_std::{
     UniformRand,
 };
 use plotters::prelude::*;
+#[cfg(test)]
+#[cfg(feature = "bench_harness")]
+#[path = "../bench.rs"]
+mod legacy;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
@@ -31,7 +37,20 @@ impl Config for FieldMTConfig {
     type TwoToOneHash = TwoToOneH;
 }
 
+struct LegacyFieldMTConfig;
+impl legacy::Config for LegacyFieldMTConfig {
+    type Leaf = [F];
+    type LeafDigest = F;
+    type LeafInnerDigestConverter = legacy::IdentityDigestConverter<F>;
+    type InnerDigest = F;
+    type LeafHash = H;
+    type TwoToOneHash = TwoToOneH;
+}
+
 type FieldMT = MerkleTree<FieldMTConfig>;
+type LegacyFieldMT = legacy::MerkleTree<LegacyFieldMTConfig>;
+type LegacyLeafParam = legacy::LeafParam<LegacyFieldMTConfig>;
+type LegacyTwoToOneParam = legacy::TwoToOneParam<LegacyFieldMTConfig>;
 
 const TREE_EXPONENTS: &[u32] = &[12, 14, 16, 18, 20];
 const BATCH_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
@@ -65,13 +84,11 @@ impl IndexPattern {
 struct TreeFixture {
     leaves: Vec<Vec<F>>,
     tree: FieldMT,
+    legacy_tree: LegacyFieldMT,
     leaf_params: LeafParam<FieldMTConfig>,
+    legacy_leaf_params: LegacyLeafParam,
     two_to_one_params: TwoToOneParam<FieldMTConfig>,
-}
-
-#[derive(CanonicalSerialize)]
-struct NoPruneBatch<P: Config> {
-    paths: Vec<MerklePath<P>>,
+    legacy_two_to_one_params: LegacyTwoToOneParam,
 }
 
 struct ReportRow {
@@ -100,7 +117,18 @@ trait ProofStats {
     fn total_nodes(&self) -> usize;
 }
 
-impl<P: Config> ProofStats for MultiPath<P> {
+impl<P: Config> ProofStats for CoPath<P> {
+    fn opened(&self) -> usize {
+        self.leaf_indexes.len()
+    }
+
+    fn total_nodes(&self) -> usize {
+        let inner = self.inner_copath.as_ref().map(|(_, _, _, digests)| digests.len()).unwrap_or(0);
+        self.leaf_copath.len() + inner
+    }
+}
+
+impl<P: legacy::Config> ProofStats for legacy::MultiPath<P> {
     fn opened(&self) -> usize {
         self.leaf_indexes.len()
     }
@@ -115,62 +143,12 @@ impl<P: Config> ProofStats for MultiPath<P> {
     }
 }
 
-impl<P: Config> ProofStats for MultiPathV2Bench<P> {
-    fn opened(&self) -> usize {
-        self.leaf_indexes.len()
-    }
-
-    fn total_nodes(&self) -> usize {
-        let inner = self
-            .inner_copath
-            .as_ref()
-            .map(|(_, _, _, digests)| digests.len())
-            .unwrap_or(0);
-        self.leaf_copath.len() + inner
-    }
-}
-
-impl<P: Config> ProofStats for MultiPathV2<P> {
-    fn opened(&self) -> usize {
-        self.leaf_indexes.len()
-    }
-
-    fn total_nodes(&self) -> usize {
-        self.leaf_copath.len() + self.inner_copath.len()
-    }
-}
-
-impl<P: Config> ProofStats for NoPruneBatch<P> {
-    fn opened(&self) -> usize {
-        self.paths.len()
-    }
-
-    fn total_nodes(&self) -> usize {
-        self.paths
-            .iter()
-            .map(|path| 1 + path.auth_path.len())
-            .sum()
-    }
-}
-
 const PLOT_METRICS: &[PlotMetric] = &[
     PlotMetric {
         name: "Proof Size",
         filename_prefix: "proof_size",
         y_label: "proof size (bytes)",
         value: |row: &ReportRow| Some(row.proof_bytes as f64),
-    },
-    PlotMetric {
-        name: "Proof Nodes",
-        filename_prefix: "proof_nodes",
-        y_label: "proof nodes",
-        value: |row: &ReportRow| Some(row.proof_nodes as f64),
-    },
-    PlotMetric {
-        name: "Hashes Per Opening",
-        filename_prefix: "hashes_per_opening",
-        y_label: "hashes per opened leaf",
-        value: |row: &ReportRow| Some(row.hashes_per_opening),
     },
     PlotMetric {
         name: "Proving Time",
@@ -183,12 +161,6 @@ const PLOT_METRICS: &[PlotMetric] = &[
         filename_prefix: "verify_ms",
         y_label: "verify time (ms)",
         value: |row: &ReportRow| Some(row.verify_ms),
-    },
-    PlotMetric {
-        name: "RSS Delta",
-        filename_prefix: "rss_delta_kb",
-        y_label: "rss delta (kB)",
-        value: |row: &ReportRow| row.rss_delta_kb.map(|kb| kb as f64),
     },
 ];
 
@@ -242,53 +214,21 @@ fn run_scenario(
     batch: usize,
     pattern: IndexPattern,
     indexes: &[usize],
-) -> Result<[ReportRow; 4], Box<dyn std::error::Error>> {
+) -> Result<[ReportRow; 2], Box<dyn std::error::Error>> {
     let root = fixture.tree.root();
+    let legacy_root = fixture.legacy_tree.root();
     let opened_leaves: Vec<Vec<F>> = indexes.iter().map(|&i| fixture.leaves[i].clone()).collect();
 
     let legacy_row = benchmark_strategy(
         "prefix",
-        || fixture.tree.generate_multi_proof(indexes.iter().copied()),
-        |proof, leaves| {
+        || fixture.legacy_tree.generate_multi_proof(indexes.iter().copied()),
+        |proof: &legacy::MultiPath<_>, leaves| {
             proof.verify(
-                &fixture.leaf_params,
-                &fixture.two_to_one_params,
-                &root,
+                &fixture.legacy_leaf_params,
+                &fixture.legacy_two_to_one_params,
+                &legacy_root,
                 leaves,
             )
-        },
-        &opened_leaves,
-        fixture.leaves.len(),
-        fixture.log2_size(),
-        batch,
-        pattern,
-    )?;
-
-    let no_prune_row = benchmark_strategy(
-        "no_prune",
-        || {
-            let mut paths = Vec::with_capacity(indexes.len());
-            for &idx in indexes.iter() {
-                paths.push(fixture.tree.generate_proof(idx)?);
-            }
-            Ok(NoPruneBatch { paths })
-        },
-        |proof: &NoPruneBatch<_>, leaves| {
-            if proof.paths.len() != leaves.len() {
-                return Err(crate::Error::IncorrectInputLength(proof.paths.len()));
-            }
-            for (path, leaf) in proof.paths.iter().zip(leaves.iter()) {
-                let ok = path.verify(
-                    &fixture.leaf_params,
-                    &fixture.two_to_one_params,
-                    &root,
-                    leaf.as_slice(),
-                )?;
-                if !ok {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
         },
         &opened_leaves,
         fixture.leaves.len(),
@@ -298,50 +238,21 @@ fn run_scenario(
     )?;
 
     let coset_row = benchmark_strategy(
-        "coset_v2",
-        || {
-            fixture
-                .tree
-                .generate_multi_proof_v2(indexes.iter().copied())
-        },
-        |proof: &MultiPathV2<_>, leaves| {
-            proof.verify(
-                &fixture.leaf_params,
-                &fixture.two_to_one_params,
-                &root,
-                leaves,
-            )
-        },
+        "coset",
+        || fixture.tree.generate_multi_proof(indexes.iter().copied()),
+        |proof: &CoPath<_>, leaves| proof.verify(
+            &fixture.leaf_params,
+            &fixture.two_to_one_params,
+            &root,
+            leaves,
+        ),
         &opened_leaves,
         fixture.leaves.len(),
         fixture.log2_size(),
         batch,
         pattern,
     )?;
-
-    let coset_bench_row = benchmark_strategy(
-        "coset_v2_bench",
-        || {
-            fixture
-                .tree
-                .generate_multi_proof_v2_bench(indexes.iter().copied())
-        },
-        |proof: &MultiPathV2Bench<_>, leaves| {
-            proof.verify(
-                &fixture.leaf_params,
-                &fixture.two_to_one_params,
-                &root,
-                leaves,
-            )
-        },
-        &opened_leaves,
-        fixture.leaves.len(),
-        fixture.log2_size(),
-        batch,
-        pattern,
-    )?;
-
-    Ok([legacy_row, no_prune_row, coset_row, coset_bench_row])
+    Ok([legacy_row, coset_row])
 }
 
 fn benchmark_strategy<Gen, Proof, Verify>(
@@ -376,7 +287,14 @@ where
     let verify_ok = verifier(&proof, verify_input.clone())?;
     let verify_time = verify_start.elapsed();
     let verify_rss = rss_delta_kb(rss_before_verify, rss_bytes());
-    assert!(verify_ok, "verification must succeed for {}", strategy);
+    assert!(
+        verify_ok,
+        "verification must succeed for {} (tree_n={}, batch={}, pattern={})",
+        strategy,
+        tree_size,
+        batch,
+        pattern.label()
+    );
 
     let row = ReportRow {
         tree_size,
@@ -427,19 +345,26 @@ fn sample_indexes(
 
 fn build_fixture(exp: u32) -> Result<TreeFixture, Box<dyn std::error::Error>> {
     let leaf_params = poseidon_parameters();
+    let legacy_leaf_params: LegacyLeafParam = leaf_params.clone();
     let two_to_one_params = leaf_params.clone();
+    let legacy_two_to_one_params: LegacyTwoToOneParam = two_to_one_params.clone();
 
     let num_leaves = 1usize << exp;
     let mut rng = StdRng::seed_from_u64(0x5EED_C0DE_u64 ^ (exp as u64));
     let leaves = sample_leaves(num_leaves, &mut rng);
 
     let tree = FieldMT::new(&leaf_params, &two_to_one_params, &leaves).unwrap();
+    let legacy_tree =
+        LegacyFieldMT::new(&legacy_leaf_params, &legacy_two_to_one_params, &leaves).unwrap();
 
     Ok(TreeFixture {
         leaves,
         tree,
+        legacy_tree,
         leaf_params,
+        legacy_leaf_params,
         two_to_one_params,
+        legacy_two_to_one_params,
     })
 }
 
@@ -529,7 +454,7 @@ fn write_plots(
         let mut generated = Vec::new();
         for ((tree_size, pattern), strategies) in grouped {
             let mut ordered_series: Vec<(&'static str, Vec<(f64, f64)>)> = Vec::new();
-            for &name in &["prefix", "no_prune", "coset_v2", "coset_v2_bench"] {
+            for &name in &["prefix", "coset"] {
                 if let Some(mut series) = strategies.get(name).cloned() {
                     if series.is_empty() {
                         continue;
@@ -618,9 +543,7 @@ fn write_plots(
 fn strategy_label(name: &str) -> &str {
     match name {
         "prefix" => "prefix",
-        "no_prune" => "no pruning",
-        "coset_v2" => "coset v2",
-        "coset_v2_bench" => "coset v2 (bench)",
+        "coset" => "coset",
         _ => name,
     }
 }
@@ -628,9 +551,7 @@ fn strategy_label(name: &str) -> &str {
 fn strategy_color(name: &str) -> RGBColor {
     match name {
         "prefix" => RED,
-        "no_prune" => RGBColor(255, 127, 14),
-        "coset_v2" => BLUE,
-        "coset_v2_bench" => GREEN,
+        "coset" => BLUE,
         _ => BLACK,
     }
 }
