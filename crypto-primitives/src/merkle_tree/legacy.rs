@@ -1,5 +1,4 @@
 #![allow(clippy::needless_range_loop)]
-#![allow(dead_code)]
 
 /// Defines a trait to chain two types of CRHs.
 use crate::{
@@ -167,7 +166,6 @@ impl<P: Config> Path<P> {
     /// * `leaf_size`: leaf size in number of bytes
     ///
     /// `verify` infers the tree height by setting `tree_height = self.auth_path.len() + 2`
-    #[allow(dead_code)]
     pub fn verify<L: Borrow<P::Leaf>>(
         &self,
         leaf_hash_params: &LeafParam<P>,

@@ -1,8 +1,8 @@
 #![cfg(feature = "bench_harness")]
 
 use crate::merkle_tree::{
-    tests::test_utils::poseidon_parameters, CoPath, Config, IdentityDigestConverter, LeafParam,
-    MerkleTree, TwoToOneParam,
+    legacy, tests::test_utils::poseidon_parameters, CoPath, Config, IdentityDigestConverter,
+    LeafParam, MerkleTree, TwoToOneParam,
 };
 use ark_ed_on_bls12_381::Fr;
 use ark_serialize::CanonicalSerialize;
@@ -11,10 +11,6 @@ use ark_std::{
     UniformRand,
 };
 use plotters::prelude::*;
-#[cfg(test)]
-#[cfg(feature = "bench_harness")]
-#[path = "../bench.rs"]
-mod legacy;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
