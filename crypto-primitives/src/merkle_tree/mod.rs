@@ -281,9 +281,6 @@ impl<P: Config> CoPath<P> {
 
         let d = self.tree_height;
         let leaf_depth = d - 1;
-        if d < 2 {
-            return Ok(false);
-        }
 
         // hash opened leaves and build map containing all leaf digests needed at bottom layer
         let mut leaves = leaves.into_iter();
