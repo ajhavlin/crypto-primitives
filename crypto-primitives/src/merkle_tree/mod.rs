@@ -283,42 +283,18 @@ impl<P: Config> CoPath<P> {
         let leaf_depth = d - 1;
 
         // hash opened leaves and build map containing all leaf digests needed at bottom layer
-        let mut leaves = leaves.into_iter();
-        let mut leaf_level: BTreeMap<usize, P::LeafDigest> = BTreeMap::new(); 
-        for &idx in &self.leaf_indexes {
-            let leaf = leaves.next().ok_or_else(|| crate::Error::IncorrectInputLength(self.leaf_indexes.len()))?;
-            let leaf_hash = P::LeafHash::evaluate(leaf_hash_params, leaf.borrow())?;
-            leaf_level.insert(idx, leaf_hash);
-        }
-        if leaves.next().is_some() {
-            return Err(crate::Error::IncorrectInputLength(self.leaf_indexes.len()));
-        }
+        let mut leaves_iter = leaves.into_iter();
+        let mut leaf_level =
+            Self::ingest_leaves(&self.leaf_indexes, &mut leaves_iter, leaf_hash_params)?;
 
         // Compute on-path sets A_j and reconstruct expected B*_j = siblings(A_j) \ A_j
         let index_set: BTreeSet<usize> = self.leaf_indexes.iter().copied().collect();
         let on_path = compute_on_path(leaf_depth, &index_set); // holds indices of on-path nodes at depth d
 
         // compute minimal copath at leaf layer (B*_{d-1})
-        let mut expected_leaf_coset: Vec<usize> = Vec::new();
-        for &path_idx in on_path[leaf_depth].iter() {
-            let sibling_idx = path_idx ^ 1;
-            if on_path[leaf_depth].binary_search(&sibling_idx).is_err() {
-                expected_leaf_coset.push(sibling_idx); // copath element needed for proof
-            }
-        }
-        expected_leaf_coset.sort_unstable(); // canonical order
-
-        if expected_leaf_coset.len() != self.leaf_copath.len() {
+        let expected_leaf_coset = Self::expected_leaf_coset(leaf_depth, &on_path);
+        if !Self::validate_leaf_copath(&expected_leaf_coset, &self.leaf_copath, &mut leaf_level) {
             return Ok(false);
-        }
-
-        for (sibling_idx, sibling_digest) in expected_leaf_coset.into_iter().zip(self.leaf_copath.iter()) {
-            match leaf_level.get(&sibling_idx) {
-                Some(existing) if existing != sibling_digest => return Ok(false), // digest must match new one
-                _ => {
-                    leaf_level.insert(sibling_idx, sibling_digest.clone());
-                }
-            }
         }
         
         // prepare inner-level maps for non-on-path siblings and computed parents
@@ -334,46 +310,25 @@ impl<P: Config> CoPath<P> {
             return Ok(false);
         }
 
-        // Recomputation
-        // compute parents at depth d-2 using TwoToOne::evaluate to hash inputs
-        for &parent_index in on_path[leaf_depth - 1].iter() {
-            let left = leaf_level.get(&(parent_index * 2)).cloned();
-            let right = leaf_level.get(&(parent_index * 2 + 1)).cloned();
-            let (left, right) = match (left, right) {
-                (Some(left), Some(right)) => (left, right),
-                _ => return Ok(false),
-            };
-            let parent = P::TwoToOneHash::evaluate(
-                two_to_one_params,
-                P::LeafInnerDigestConverter::convert(left)?, // convert to inner-hash input type
-                P::LeafInnerDigestConverter::convert(right)?,
-            )?;
-            inner_levels[leaf_depth - 1].insert(parent_index, parent.clone());
-            // add parent to LUT at heap index
-            let heap_idx = level_index(leaf_depth - 1, parent_index);
-            hash_lut.insert(heap_idx, parent);
+        if !Self::recompute_bottom_parents(
+            leaf_depth,
+            &on_path,
+            &leaf_level,
+            two_to_one_params,
+            &mut hash_lut,
+            &mut inner_levels,
+        )? {
+            return Ok(false);
         }
 
-        // compute inner layers up to root using TwoToOne::compress to hash inner digests
-        for depth in (1..=leaf_depth - 1).rev() {
-            let parent_depth = depth - 1;
-            for &parent_index in on_path[parent_depth].iter() {
-                let left = inner_levels[depth].get(&(parent_index * 2)).cloned();
-                let right = inner_levels[depth].get(&(parent_index * 2 + 1)).cloned();
-                let (left, right) = match (left, right) {
-                    (Some(left), Some(right)) => (left, right),
-                    _ => return Ok(false),
-                };
-                let parent = P::TwoToOneHash::compress(
-                    two_to_one_params, 
-                    &left, 
-                    &right,
-                )?;
-                inner_levels[parent_depth].insert(parent_index, parent.clone());
-                // add parent to LUT at heap index
-                let heap_idx = level_index(parent_depth, parent_index);
-                hash_lut.insert(heap_idx, parent);
-            }
+        if !Self::recompute_inner_layers(
+            leaf_depth,
+            &on_path,
+            two_to_one_params,
+            &mut hash_lut,
+            &mut inner_levels,
+        )? {
+            return Ok(false);
         }
 
         // check root
@@ -468,6 +423,124 @@ impl<P: Config> CoPath<P> {
         }
 
         Some((first.0, first.1, deltas, digests))
+    }
+
+    /// Hashes provided leaves (ordered by `leaf_indexes`) and returns a map from leaf index to digest.
+    fn ingest_leaves<L, I>(
+        leaf_indexes: &[usize],
+        leaves: &mut I,
+        leaf_hash_params: &LeafParam<P>,
+    ) -> Result<BTreeMap<usize, P::LeafDigest>, crate::Error>
+    where
+        L: Borrow<P::Leaf>,
+        I: Iterator<Item = L>,
+    {
+        let mut leaf_level: BTreeMap<usize, P::LeafDigest> = BTreeMap::new();
+        for &idx in leaf_indexes {
+            let leaf = leaves
+                .next()
+                .ok_or_else(|| crate::Error::IncorrectInputLength(leaf_indexes.len()))?;
+            let leaf_hash = P::LeafHash::evaluate(leaf_hash_params, leaf.borrow())?;
+            leaf_level.insert(idx, leaf_hash);
+        }
+        if leaves.next().is_some() {
+            return Err(crate::Error::IncorrectInputLength(leaf_indexes.len()));
+        }
+        Ok(leaf_level)
+    }
+
+    /// Computes the minimal leaf-layer copath indices `B*_{d-1}` (siblings of on-path nodes not on-path).
+    fn expected_leaf_coset(leaf_depth: usize, on_path: &[Vec<usize>]) -> Vec<usize> {
+        let mut expected_leaf_coset: Vec<usize> = Vec::new();
+        for &path_idx in on_path[leaf_depth].iter() {
+            let sibling_idx = path_idx ^ 1;
+            if on_path[leaf_depth].binary_search(&sibling_idx).is_err() {
+                expected_leaf_coset.push(sibling_idx); // copath element needed for proof
+            }
+        }
+        expected_leaf_coset.sort_unstable(); // canonical order
+        expected_leaf_coset
+    }
+
+    /// Confirms provided leaf copath matches the expected indices and augments `leaf_level` with them.
+    fn validate_leaf_copath(
+        expected_leaf_coset: &[usize],
+        provided_leaf_copath: &[P::LeafDigest],
+        leaf_level: &mut BTreeMap<usize, P::LeafDigest>,
+    ) -> bool {
+        if expected_leaf_coset.len() != provided_leaf_copath.len() {
+            return false;
+        }
+
+        for (sibling_idx, sibling_digest) in expected_leaf_coset.iter().zip(provided_leaf_copath) {
+            match leaf_level.get(sibling_idx) {
+                Some(existing) if existing != sibling_digest => return false, // digest must match new one
+                _ => {
+                    leaf_level.insert(*sibling_idx, sibling_digest.clone());
+                }
+            }
+        }
+        true
+    }
+
+    /// Recomputes parents at depth `d-2` (immediately above leaves) using the leaf digests and LUT.
+    fn recompute_bottom_parents(
+        leaf_depth: usize,
+        on_path: &[Vec<usize>],
+        leaf_level: &BTreeMap<usize, P::LeafDigest>,
+        two_to_one_params: &TwoToOneParam<P>,
+        hash_lut: &mut HashMap<usize, P::InnerDigest, BuildHasherDefault<DefaultHasher>>,
+        inner_levels: &mut [BTreeMap<usize, P::InnerDigest>],
+    ) -> Result<bool, crate::Error> {
+        for &parent_index in on_path[leaf_depth - 1].iter() {
+            let left = leaf_level.get(&(parent_index * 2)).cloned();
+            let right = leaf_level.get(&(parent_index * 2 + 1)).cloned();
+            let (left, right) = match (left, right) {
+                (Some(left), Some(right)) => (left, right),
+                _ => return Ok(false),
+            };
+            let parent = P::TwoToOneHash::evaluate(
+                two_to_one_params,
+                P::LeafInnerDigestConverter::convert(left)?, // convert to inner-hash input type
+                P::LeafInnerDigestConverter::convert(right)?,
+            )?;
+            inner_levels[leaf_depth - 1].insert(parent_index, parent.clone());
+            // add parent to LUT at heap index
+            let heap_idx = level_index(leaf_depth - 1, parent_index);
+            hash_lut.insert(heap_idx, parent);
+        }
+        Ok(true)
+    }
+
+    /// Recomputes inner layers up to the root using cached inner digests and stores results in LUT.
+    fn recompute_inner_layers(
+        leaf_depth: usize,
+        on_path: &[Vec<usize>],
+        two_to_one_params: &TwoToOneParam<P>,
+        hash_lut: &mut HashMap<usize, P::InnerDigest, BuildHasherDefault<DefaultHasher>>,
+        inner_levels: &mut [BTreeMap<usize, P::InnerDigest>],
+    ) -> Result<bool, crate::Error> {
+        for depth in (1..=leaf_depth - 1).rev() {
+            let parent_depth = depth - 1;
+            for &parent_index in on_path[parent_depth].iter() {
+                let left = inner_levels[depth].get(&(parent_index * 2)).cloned();
+                let right = inner_levels[depth].get(&(parent_index * 2 + 1)).cloned();
+                let (left, right) = match (left, right) {
+                    (Some(left), Some(right)) => (left, right),
+                    _ => return Ok(false),
+                };
+                let parent = P::TwoToOneHash::compress(
+                    two_to_one_params, 
+                    &left, 
+                    &right,
+                )?;
+                inner_levels[parent_depth].insert(parent_index, parent.clone());
+                // add parent to LUT at heap index
+                let heap_idx = level_index(parent_depth, parent_index);
+                hash_lut.insert(heap_idx, parent);
+            }
+        }
+        Ok(true)
     }
 
     /// Decodes inner co-path entries back into their usize equivalents
