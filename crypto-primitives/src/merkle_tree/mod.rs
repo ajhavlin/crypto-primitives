@@ -641,25 +641,24 @@ impl<P: Config> CoPath<P> {
         true
     }
 
-    // TODO: git commit changes and then consult this 
     // The position of on_path node in `leaf_and_sibling_hash` and `non_leaf_and_sibling_hash_path`.
     // `position[i]` is 0 (false) iff `i`th on-path node from top to bottom is on the left.
     //
     // This function simply converts every index in `self.leaf_indexes` to boolean array in big endian form.
-    // #[allow(unused)] // this function is actually used when r1cs feature is on
-    // fn position_list(&'_ self) -> impl '_ + Iterator<Item = Vec<bool>> {
-    //     let path_len = self.auth_paths_suffixes[0].len();
+    #[allow(unused)] // this function is actually used when r1cs feature is on
+    fn position_list(&'_ self) -> impl '_ + Iterator<Item = Vec<bool>> {
+        let path_len = self.tree_height.saturating_sub(2);
 
-    //     cfg_into_iter!(self.leaf_indexes.clone())
-    //         .map(move |i| {
-    //             (0..path_len + 1)
-    //                 .map(move |j| ((i >> j) & 1) != 0)
-    //                 .rev()
-    //                 .collect()
-    //         })
-    //         .collect::<Vec<_>>()
-    //         .into_iter()
-    // }
+        cfg_into_iter!(self.leaf_indexes.clone())
+            .map(move |i| {
+                (0..path_len + 1)
+                    .map(move |j| ((i >> j) & 1) != 0)
+                    .rev()
+                    .collect()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
 }
 
 /// `index` is the first `path.len()` bits of
