@@ -1161,10 +1161,10 @@ fn decode_delta(bytes: &[u8], cursor: &mut usize) -> Option<i64> {
 #[inline]
 fn encode_varint(buffer: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
-        buffer.push(((value as u8) & 0x7F) | 0x80);
+        buffer.push(((value as u8) & 0x7F) | 0x80); // MSB = 1 => more bytes follow
         value >>= 7;
     }
-    buffer.push(value as u8);
+    buffer.push(value as u8); // last byte, MSB = 0
 }
 
 fn decode_varint(bytes: &[u8], cursor: &mut usize) -> Option<u64> {

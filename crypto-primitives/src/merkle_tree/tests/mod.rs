@@ -1,6 +1,7 @@
 #[cfg(feature = "constraints")]
 mod constraints;
 mod test_utils;
+mod delta_encoding_tests;
 
 #[cfg(all(test, feature = "bench_harness"))]
 mod bench_report;
@@ -438,4 +439,107 @@ mod field_mt_tests {
         assert!(!ok, "mismatched leaf ordering must fail verification");
     }
 
+}
+
+mod delta_encoding_spacing_tests {
+    use super::super::{decode_delta, CoPath, Config, IdentityDigestConverter, CRHScheme, TwoToOneCRHScheme};
+    use ark_std::borrow::Borrow;
+
+    struct DummyCfg;
+    impl Config for DummyCfg {
+        type Leaf = ();
+        type LeafDigest = u8;
+        type LeafInnerDigestConverter = IdentityDigestConverter<u8>;
+        type InnerDigest = u8;
+        type LeafHash = DummyLeafHash;
+        type TwoToOneHash = DummyTwoToOne;
+    }
+
+    struct DummyLeafHash;
+    impl CRHScheme for DummyLeafHash {
+        type Input = ();
+        type Output = u8;
+        type Parameters = ();
+
+        fn setup<R: ark_std::rand::Rng>(_rng: &mut R) -> Result<Self::Parameters, super::super::Error> {
+            Ok(())
+        }
+
+        fn evaluate<T: Borrow<Self::Input>>(
+            _parameters: &Self::Parameters,
+            _input: T,
+        ) -> Result<Self::Output, super::super::Error> {
+            Ok(0)
+        }
+    }
+
+    struct DummyTwoToOne;
+    impl TwoToOneCRHScheme for DummyTwoToOne {
+        type Input = u8;
+        type Output = u8;
+        type Parameters = ();
+
+        fn setup<R: ark_std::rand::Rng>(_rng: &mut R) -> Result<Self::Parameters, super::super::Error> {
+            Ok(())
+        }
+
+        fn evaluate<T: Borrow<Self::Input>>(
+            _parameters: &Self::Parameters,
+            left: T,
+            right: T,
+        ) -> Result<Self::Output, super::super::Error> {
+            Ok(*left.borrow() ^ *right.borrow())
+        }
+
+        fn compress<T: Borrow<Self::Output>>(
+            _parameters: &Self::Parameters,
+            left: T,
+            right: T,
+        ) -> Result<Self::Output, super::super::Error> {
+            Ok(*left.borrow() ^ *right.borrow())
+        }
+    }
+
+    #[test]
+    fn packed_deltas_save_with_large_index_gaps() {
+        // Coordinate entries are sorted lexicographically by (depth, index), and deltas are taken
+        // between consecutive coordinates in this order (not relative to a global heap index).
+        //
+        // This test demonstrates the worst case spaced openings scenario at the leaf level, plus a
+        // higher-layer sibling at depth d-2. 
+        let d: usize = 14;
+        let depth_inner = d - 2;
+        let depth_leaf = d - 1;
+
+        let mid = 1usize << (d - 2);
+        let end = (1usize << (d - 1)) - 1;
+
+        let entries: Vec<(usize, usize, u8)> = vec![
+            (depth_inner, 0, 10),
+            (depth_leaf, 0, 20),
+            (depth_leaf, mid, 30),
+            (depth_leaf, end, 40),
+        ];
+
+        let packed = CoPath::<DummyCfg>::pack_inner_copath(&entries).expect("packs");
+        let (_start_depth, _start_index, deltas, _digests) = packed; // returns `deltas` which is a Vec<u8>.
+
+        // The first step is from (d-2,0) -> (d-1,0): depth delta is +1, index delta is 0.
+        let mut cursor = 0usize;
+        let depth_delta = decode_delta(&deltas, &mut cursor).expect("depth delta decodes");
+        let index_delta = decode_delta(&deltas, &mut cursor).expect("index delta decodes");
+        assert_eq!(depth_delta, 1);
+        assert_eq!(index_delta, 0);
+
+        // Sanity check that the packed coordinate encoding is smaller than storing every (depth,index)
+        // as a fixed-width pair of `usize`s.
+        let naive_coord_bytes = entries.len() * 2 * core::mem::size_of::<usize>();
+        let packed_coord_bytes = 2 * core::mem::size_of::<usize>() + deltas.len();
+        assert!(
+            packed_coord_bytes < naive_coord_bytes,
+            "expected packed coordinates to be smaller (packed={}, naive={})",
+            packed_coord_bytes,
+            naive_coord_bytes
+        );
+    }
 }
