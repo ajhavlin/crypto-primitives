@@ -68,7 +68,7 @@ mod bytes_mt_tests {
             .unwrap();
 
         assert!(multi_proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
+            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), leaves.clone())
             .unwrap());
 
         // test merkle tree update functionality
@@ -93,7 +93,7 @@ mod bytes_mt_tests {
             .unwrap();
 
         assert!(multi_proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
+            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), leaves.clone())
             .unwrap());
     }
 
@@ -172,6 +172,7 @@ mod bytes_mt_tests {
                 &leaf_crh_params,
                 &two_to_one_params,
                 &tree.root(),
+                tree.height(),
                 serialized_leaves.clone()
             )
             .unwrap());
@@ -226,7 +227,7 @@ mod field_mt_tests {
             .unwrap();
 
         assert!(multi_proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
+            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), leaves.clone())
             .unwrap());
 
         {
@@ -252,6 +253,7 @@ mod field_mt_tests {
                     &leaf_crh_params,
                     &two_to_one_params,
                     &wrong_root,
+                    tree.height(),
                     leaves.clone()
                 )
                 .unwrap());
@@ -279,7 +281,7 @@ mod field_mt_tests {
             .unwrap();
 
         assert!(multi_proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, leaves.clone())
+            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), leaves.clone())
             .unwrap());
     }
 
@@ -316,7 +318,7 @@ mod field_mt_tests {
         let proof = tree.generate_multi_proof(Vec::<usize>::new()).unwrap();
         assert!(
             proof
-                .verify(&leaf_crh_params, &two_to_one_params, &root, Vec::<Vec<F>>::new())
+                .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), Vec::<Vec<F>>::new())
                 .unwrap(),
             "empty batch proof should verify"
         );
@@ -344,7 +346,7 @@ mod field_mt_tests {
 
         assert!(
             proof
-                .verify(&leaf_crh_params, &two_to_one_params, &root, opened)
+                .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), opened)
                 .unwrap(),
             "proof with duplicate input indices should verify after deduplication"
         );
@@ -371,7 +373,7 @@ mod field_mt_tests {
             .collect();
 
         let ok = bad
-            .verify(&leaf_crh_params, &two_to_one_params, &root, opened)
+            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), opened)
             .unwrap();
         assert!(!ok, "tampered leaf_copath digest must fail verification");
     }
@@ -398,7 +400,7 @@ mod field_mt_tests {
             .map(|&i| leaves[i].clone())
             .collect();
         let ok = bad
-            .verify(&leaf_crh_params, &two_to_one_params, &root, opened)
+            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), opened)
             .unwrap();
         assert!(!ok, "missing inner copath entry must invalidate the proof");
     }
@@ -423,7 +425,7 @@ mod field_mt_tests {
             .collect();
         assert!(
             proof
-                .verify(&leaf_crh_params, &two_to_one_params, &root, ordered_leaves.clone())
+                .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), ordered_leaves.clone())
                 .unwrap(),
             "proof should verify when leaves follow proof.leaf_indexes order"
         );
@@ -434,7 +436,7 @@ mod field_mt_tests {
             .map(|&i| leaves[i].clone())
             .collect();
         let ok = proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, shuffled_leaves)
+            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), shuffled_leaves)
             .unwrap();
         assert!(!ok, "mismatched leaf ordering must fail verification");
     }

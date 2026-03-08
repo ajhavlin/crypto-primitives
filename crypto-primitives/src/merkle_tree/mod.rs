@@ -8,7 +8,7 @@ use crate::{
     sponge::Absorb,
     Error,
 };
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Read, SerializationError, Valid, Validate};
 #[cfg(not(feature = "std"))]
 use ark_std::vec::Vec;
 use ark_std::{
@@ -245,7 +245,7 @@ impl<P: Config> Path<P> {
 ///  Thus, inner copath is `[(2,0,D), (1,1,C)]`.
 ///  Intuitively, CoSet transmits only what's missing to recompute every parent on the shared union-of-paths.
 
-#[derive(Derivative, CanonicalSerialize, CanonicalDeserialize)]
+#[derive(Derivative, CanonicalSerialize)]
 #[derivative(
     Clone(bound = "P: Config"),
     Debug(bound = "P: Config"),
@@ -253,7 +253,7 @@ impl<P: Config> Path<P> {
 )]
 pub struct CoPath<P: Config> {
     /// stores the height of the tree (>= 2) to drive CoSet decoding
-    pub tree_height: usize,
+    pub(crate) tree_height: usize,
     /// For leaf layer, stores co-path digests (B*_{d-1}) in ascending sibling index order
     pub leaf_copath: Vec<P::LeafDigest>,
     /// For inner layers, stores co-path entries packed as (start_depth, start_index, packed deltas, digests)
@@ -262,21 +262,68 @@ pub struct CoPath<P: Config> {
     pub leaf_indexes: Vec<usize>,
 }
 
+/// Supertrait for CanonicalDeserialize:
+impl<P: Config> Valid for CoPath<P> {
+    fn check(&self) -> Result<(), SerializationError> {
+        if self.tree_height < 2 {
+            return Err(SerializationError::InvalidData);
+        }
+        /// propagate each fields validity check to ensure the entire structure is valid
+        self.leaf_copath.check()?;
+        self.inner_copath.check()?;
+        self.leaf_indexes.check()
+    }
+}
+
+impl<P: Config> CanonicalDeserialize for CoPath<P> {
+    fn deserialize_with_mode<R: Read>(
+        mut reader: R,
+        compress: Compress,
+        validate: Validate,
+    ) -> Result<Self, SerializationError> {
+        let tree_height = usize::deserialize_with_mode(&mut reader, compress, validate)?;
+        let leaf_copath =
+            Vec::<P::LeafDigest>::deserialize_with_mode(&mut reader, compress, validate)?;
+        let inner_copath =
+            Option::<PackedInnerCopath<P>>::deserialize_with_mode(&mut reader, compress, validate)?;
+        let leaf_indexes =
+            Vec::<usize>::deserialize_with_mode(&mut reader, compress, validate)?;
+        if tree_height < 2 {
+            return Err(SerializationError::InvalidData);
+        }
+        Ok(CoPath { tree_height, leaf_copath, inner_copath, leaf_indexes })
+    }
+}
+
 impl<P: Config> CoPath<P> {
     /// Verify that leaves are at `self.leaf_indexes` of the merkle tree.
     /// Note that the order of the leaves hashes should match the leaves respective indexes
     /// * `leaf_size`: leaf size in number of bytes
     ///
-    /// `verify` infers the tree height by setting `tree_height = self.auth_paths_suffixes[0].len() + 2`
+    /// `expected_tree_height` must equal the height of the tree the proof was generated from;
+    /// the verifier supplies this value — it is not taken from the (prover-controlled) proof.
     pub fn verify<L: Borrow<P::Leaf> + Clone>(
         &self,
         leaf_hash_params: &LeafParam<P>,
         two_to_one_params: &TwoToOneParam<P>,
         root_hash: &P::InnerDigest,
+        expected_tree_height: usize,
         leaves: impl IntoIterator<Item = L>,
     ) -> Result<bool, crate::Error> {
         if self.leaf_indexes.is_empty() {
-            return Ok(true)
+            return Err(crate::Error::GenericError(
+                "batch proof must contain at least one leaf index".into()
+            ));
+        }
+
+        if self.tree_height < 2 {
+            return Err(crate::Error::GenericError(
+                "tree_height must be >= 2".into()
+            ));
+        }
+
+        if self.tree_height != expected_tree_height {
+            return Ok(false);
         }
 
         let d = self.tree_height;
