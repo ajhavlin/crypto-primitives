@@ -131,6 +131,78 @@ pub trait Config {
 pub type TwoToOneParam<P> = <<P as Config>::TwoToOneHash as TwoToOneCRHScheme>::Parameters;
 pub type LeafParam<P> = <<P as Config>::LeafHash as CRHScheme>::Parameters;
 
+/// Barebones design sketch for the next security-critical iteration of this module.
+///
+/// This is intentionally non-operative. It does not alter hashing, proof encoding,
+/// or verification. Its purpose is to make the near-term scope legible in code:
+/// 1. add local Merkle-layer domain separation first,
+/// 2. leave room for a later global domain-separation story,
+/// 3. make k-ary leaf grouping an explicit design axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MerkleDesignSketch {
+    pub domain_scope: DomainScopeSketch,
+    pub leaf_shape: LeafShapeSketch,
+}
+
+impl MerkleDesignSketch {
+    /// Current narrowing of scope:
+    /// * local Merkle domain separation is the first concrete target,
+    /// * leaves are still binary from the verifier's point of view,
+    /// * k-ary leaves are planned but not yet implemented.
+    pub const LOCAL_DOMAIN_FIRST: Self = Self {
+        domain_scope: DomainScopeSketch::local_only(),
+        leaf_shape: LeafShapeSketch::binary(),
+    };
+}
+
+/// Sketches where we intend to separate domains once the hash interfaces are extended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DomainScopeSketch {
+    pub local_merkle_tags: LocalMerkleDomainSketch,
+    pub global_domain_tag: Option<&'static [u8]>,
+}
+
+impl DomainScopeSketch {
+    pub const fn local_only() -> Self {
+        Self {
+            local_merkle_tags: LocalMerkleDomainSketch::MERKLE_LOCAL_DEFAULT,
+            global_domain_tag: None,
+        }
+    }
+}
+
+/// Local Merkle separation means leaf-layer hashing and inner-node hashing cannot
+/// accidentally share the same transcript, even if they reuse the same primitive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalMerkleDomainSketch {
+    pub leaf_tag: &'static [u8],
+    pub inner_tag: &'static [u8],
+}
+
+impl LocalMerkleDomainSketch {
+    pub const MERKLE_LOCAL_DEFAULT: Self = Self {
+        leaf_tag: b"merkle:leaf",
+        inner_tag: b"merkle:inner",
+    };
+}
+
+/// Sketch for future leaf semantics. Today a "leaf" is a single user item.
+/// The next design step may allow one logical leaf to commit to `k` items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeafShapeSketch {
+    pub items_per_leaf: usize,
+}
+
+impl LeafShapeSketch {
+    pub const fn binary() -> Self {
+        Self { items_per_leaf: 1 }
+    }
+
+    pub const fn k_ary(items_per_leaf: usize) -> Self {
+        Self { items_per_leaf }
+    }
+}
+
 /// Stores the hashes of a particular path (in order) from root to leaf.
 /// For example:
 /// ```tree_diagram
@@ -268,7 +340,7 @@ impl<P: Config> Valid for CoPath<P> {
         if self.tree_height < 2 {
             return Err(SerializationError::InvalidData);
         }
-        /// propagate each fields validity check to ensure the entire structure is valid
+        // Propagate each field validity check to ensure the entire structure is valid.
         self.leaf_copath.check()?;
         self.inner_copath.check()?;
         self.leaf_indexes.check()

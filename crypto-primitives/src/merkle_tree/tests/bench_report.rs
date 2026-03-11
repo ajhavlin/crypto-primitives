@@ -51,6 +51,8 @@ type LegacyTwoToOneParam = legacy::TwoToOneParam<LegacyFieldMTConfig>;
 const TREE_EXPONENTS: &[u32] = &[12, 14, 16, 18, 20];
 const BATCH_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 const LEAF_WIDTH: usize = 3;
+const TIMING_WARMUP_TRIALS: usize = 2;
+const TIMING_MEASURE_TRIALS: usize = 9;
 
 #[derive(Clone, Copy)]
 enum IndexPattern {
@@ -97,7 +99,10 @@ struct ReportRow {
     proof_nodes: usize,
     hashes_per_opening: f64,
     prove_ms: f64,
+    prove_ms_stddev: f64,
     verify_ms: f64,
+    verify_ms_stddev: f64,
+    timing_trials: usize,
     rss_delta_kb: Option<i64>,
 }
 
@@ -119,7 +124,11 @@ impl<P: Config> ProofStats for CoPath<P> {
     }
 
     fn total_nodes(&self) -> usize {
-        let inner = self.inner_copath.as_ref().map(|(_, _, _, digests)| digests.len()).unwrap_or(0);
+        let inner = self
+            .inner_copath
+            .as_ref()
+            .map(|(_, _, _, digests)| digests.len())
+            .unwrap_or(0);
         self.leaf_copath.len() + inner
     }
 }
@@ -130,11 +139,7 @@ impl<P: legacy::Config> ProofStats for legacy::MultiPath<P> {
     }
 
     fn total_nodes(&self) -> usize {
-        let auth_len: usize = self
-            .auth_paths_suffixes
-            .iter()
-            .map(|path| path.len())
-            .sum();
+        let auth_len: usize = self.auth_paths_suffixes.iter().map(|path| path.len()).sum();
         self.leaf_siblings_hashes.len() + auth_len
     }
 }
@@ -167,6 +172,8 @@ fn multiproof_v2_benchmark_report() {
 }
 
 fn run_report() -> Result<(), Box<dyn std::error::Error>> {
+    // Data flow: benchmark fixtures -> (k, pattern) scenarios -> ReportRow entries ->
+    // machine-readable CSV + markdown table + baseline SVG plots.
     let mut fixtures = Vec::new();
     for &exp in TREE_EXPONENTS {
         fixtures.push(build_fixture(exp)?);
@@ -200,6 +207,7 @@ fn run_report() -> Result<(), Box<dyn std::error::Error>> {
 
     let report_dir = PathBuf::from("target/merkle_tree_reports");
     fs::create_dir_all(&report_dir)?;
+    write_rows_csv(&rows, &report_dir)?;
     let plot_files = write_plots(&rows, &report_dir)?;
     write_report(&rows, &report_dir, &plot_files)?;
     Ok(())
@@ -217,7 +225,11 @@ fn run_scenario(
 
     let legacy_row = benchmark_strategy(
         "prefix",
-        || fixture.legacy_tree.generate_multi_proof(indexes.iter().copied()),
+        || {
+            fixture
+                .legacy_tree
+                .generate_multi_proof(indexes.iter().copied())
+        },
         |proof: &legacy::MultiPath<_>, leaves| {
             proof.verify(
                 &fixture.legacy_leaf_params,
@@ -236,12 +248,15 @@ fn run_scenario(
     let coset_row = benchmark_strategy(
         "coset",
         || fixture.tree.generate_multi_proof(indexes.iter().copied()),
-        |proof: &CoPath<_>, leaves| proof.verify(
-            &fixture.leaf_params,
-            &fixture.two_to_one_params,
-            &root,
-            leaves,
-        ),
+        |proof: &CoPath<_>, leaves| {
+            proof.verify(
+                &fixture.leaf_params,
+                &fixture.two_to_one_params,
+                &root,
+                fixture.tree.height(),
+                leaves,
+            )
+        },
         &opened_leaves,
         fixture.leaves.len(),
         fixture.log2_size(),
@@ -267,9 +282,7 @@ where
     Verify: FnMut(&Proof, Vec<Vec<F>>) -> Result<bool, crate::Error>,
 {
     let rss_before = rss_bytes();
-    let prove_start = std::time::Instant::now();
     let proof = generator()?;
-    let prove_time = prove_start.elapsed();
     let prove_rss = rss_delta_kb(rss_before, rss_bytes());
 
     let proof_bytes = serialized_size(&proof);
@@ -279,9 +292,7 @@ where
 
     let verify_input = opened_leaves.to_vec();
     let rss_before_verify = rss_bytes();
-    let verify_start = std::time::Instant::now();
     let verify_ok = verifier(&proof, verify_input.clone())?;
-    let verify_time = verify_start.elapsed();
     let verify_rss = rss_delta_kb(rss_before_verify, rss_bytes());
     assert!(
         verify_ok,
@@ -292,6 +303,45 @@ where
         pattern.label()
     );
 
+    for _ in 0..TIMING_WARMUP_TRIALS {
+        let _ = generator()?;
+    }
+    let mut prove_samples = Vec::with_capacity(TIMING_MEASURE_TRIALS);
+    for _ in 0..TIMING_MEASURE_TRIALS {
+        let start = std::time::Instant::now();
+        let _ = generator()?;
+        prove_samples.push(duration_ms(start.elapsed()));
+    }
+    let (prove_ms, prove_ms_stddev) = mean_stddev(&prove_samples);
+
+    for _ in 0..TIMING_WARMUP_TRIALS {
+        let ok = verifier(&proof, verify_input.clone())?;
+        assert!(
+            ok,
+            "timed verification warmup failed for {} (tree_n={}, batch={}, pattern={})",
+            strategy,
+            tree_size,
+            batch,
+            pattern.label()
+        );
+    }
+    let mut verify_samples = Vec::with_capacity(TIMING_MEASURE_TRIALS);
+    for _ in 0..TIMING_MEASURE_TRIALS {
+        let start = std::time::Instant::now();
+        let ok = verifier(&proof, verify_input.clone())?;
+        let elapsed = duration_ms(start.elapsed());
+        assert!(
+            ok,
+            "timed verification failed for {} (tree_n={}, batch={}, pattern={})",
+            strategy,
+            tree_size,
+            batch,
+            pattern.label()
+        );
+        verify_samples.push(elapsed);
+    }
+    let (verify_ms, verify_ms_stddev) = mean_stddev(&verify_samples);
+
     let row = ReportRow {
         tree_size,
         log2_size,
@@ -301,8 +351,11 @@ where
         proof_bytes,
         proof_nodes,
         hashes_per_opening,
-        prove_ms: duration_ms(prove_time),
-        verify_ms: duration_ms(verify_time),
+        prove_ms,
+        prove_ms_stddev,
+        verify_ms,
+        verify_ms_stddev,
+        timing_trials: TIMING_MEASURE_TRIALS,
         rss_delta_kb: combine_rss(prove_rss, verify_rss),
     };
 
@@ -386,17 +439,17 @@ fn write_report(
     )?;
     writeln!(
         file,
-        "| tree_n | log2(n) | batch_k | pattern | strategy | proof_bytes | proof_nodes | hashes/leaf | prove_ms | verify_ms | rss_delta_kb |"
+        "| tree_n | log2(n) | batch_k | pattern | strategy | proof_bytes | proof_nodes | hashes/leaf | prove_ms | prove_stddev | verify_ms | verify_stddev | timing_trials | rss_delta_kb |"
     )?;
     writeln!(
         file,
-        "| ------ | ------- | ------- | ------- | -------- | ----------- | ----------- | ------------ | -------- | --------- | ------------ |"
+        "| ------ | ------- | ------- | ------- | -------- | ----------- | ----------- | ------------ | -------- | ------------ | --------- | ------------- | ------------- | ------------ |"
     )?;
 
     for row in rows {
         writeln!(
             file,
-            "| {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.4} | {:.4} | {:.4} | {} | {} |",
             row.tree_size,
             row.log2_size,
             row.batch,
@@ -406,7 +459,10 @@ fn write_report(
             row.proof_nodes,
             row.hashes_per_opening,
             row.prove_ms,
+            row.prove_ms_stddev,
             row.verify_ms,
+            row.verify_ms_stddev,
+            row.timing_trials,
             row.rss_delta_kb
                 .map(|kb| kb.to_string())
                 .unwrap_or_else(|| "-".into())
@@ -419,8 +475,47 @@ fn write_report(
         }
         writeln!(file, "\n## {} Visualizations\n", metric)?;
         for plot in files {
-            writeln!(file, "![{}]({})", metric.replace(' ', "-").to_lowercase(), plot)?;
+            writeln!(
+                file,
+                "![{}]({})",
+                metric.replace(' ', "-").to_lowercase(),
+                plot
+            )?;
         }
+    }
+
+    Ok(())
+}
+
+fn write_rows_csv(rows: &[ReportRow], report_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let csv_path = report_dir.join("multiproof_v2_rows.csv");
+    let mut file = File::create(csv_path)?;
+
+    writeln!(
+        file,
+        "tree_size,log2_size,batch,pattern,strategy,proof_bytes,proof_nodes,hashes_per_opening,prove_ms,prove_ms_stddev,verify_ms,verify_ms_stddev,timing_trials,rss_delta_kb"
+    )?;
+    for row in rows {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{},{}",
+            row.tree_size,
+            row.log2_size,
+            row.batch,
+            row.pattern,
+            row.strategy,
+            row.proof_bytes,
+            row.proof_nodes,
+            row.hashes_per_opening,
+            row.prove_ms,
+            row.prove_ms_stddev,
+            row.verify_ms,
+            row.verify_ms_stddev,
+            row.timing_trials,
+            row.rss_delta_kb
+                .map(|kb| kb.to_string())
+                .unwrap_or_else(|| "".to_string())
+        )?;
     }
 
     Ok(())
@@ -460,8 +555,7 @@ fn write_plots(
                 }
             }
 
-            if ordered_series.len() < 2
-                || !ordered_series.iter().any(|(name, _)| *name == "prefix")
+            if ordered_series.len() < 2 || !ordered_series.iter().any(|(name, _)| *name == "prefix")
             {
                 continue;
             }
@@ -486,10 +580,7 @@ fn write_plots(
             let x_pad = ((max_x - min_x) * 0.05).max(1.0);
             let y_pad = ((max_y - min_y) * 0.05).max(1.0);
 
-            let filename = format!(
-                "{}_{}_{}.svg",
-                metric.filename_prefix, tree_size, pattern
-            );
+            let filename = format!("{}_{}_{}.svg", metric.filename_prefix, tree_size, pattern);
             let filepath = report_dir.join(&filename);
             let filepath_str = filepath.to_string_lossy().to_string();
             let drawing_area = SVGBackend::new(&filepath_str, (960, 540)).into_drawing_area();
@@ -497,7 +588,10 @@ fn write_plots(
 
             let mut chart = ChartBuilder::on(&drawing_area)
                 .caption(
-                    format!("{} vs k (n={}, pattern={})", metric.name, tree_size, pattern),
+                    format!(
+                        "{} vs k (n={}, pattern={})",
+                        metric.name, tree_size, pattern
+                    ),
                     ("sans-serif", 26),
                 )
                 .margin(20)
@@ -525,7 +619,10 @@ fn write_plots(
                     });
             }
 
-            chart.configure_series_labels().border_style(&BLACK).draw()?;
+            chart
+                .configure_series_labels()
+                .border_style(&BLACK)
+                .draw()?;
 
             generated.push(filename);
         }
@@ -598,6 +695,23 @@ fn serialized_size<T: CanonicalSerialize>(value: &T) -> usize {
 
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+fn mean_stddev(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = values.len() as f64;
+    let mean = values.iter().copied().sum::<f64>() / n;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / n;
+    (mean, variance.sqrt())
 }
 
 impl TreeFixture {

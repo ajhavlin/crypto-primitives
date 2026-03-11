@@ -34,6 +34,20 @@ This library comes with unit tests for each of the provided crates. Run the test
 cargo test
 ```
 
+## Regenerate multiproof presentation figures
+
+```bash
+# 1) Regenerate benchmark rows/plots in target/merkle_tree_reports/
+cargo test -p ark-crypto-primitives --features merkle_tree,bench_harness multiproof_v2_benchmark_report -- --ignored
+
+# 2) Render slide-ready figures in figures/presentation/
+python3 scripts/presentation_plots.py --output figures/presentation
+
+# Optional explicit input override:
+# --input target/merkle_tree_reports/multiproof_v2_rows.csv
+# --input target/merkle_tree_reports/multiproof_v2_report.md
+```
+
 ## License
 
 This library is licensed under either of the following licenses, at your discretion.

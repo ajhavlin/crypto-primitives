@@ -2,6 +2,7 @@
 mod constraints;
 mod test_utils;
 mod delta_encoding_tests;
+mod ctf_challenges;
 
 #[cfg(all(test, feature = "bench_harness"))]
 mod bench_report;

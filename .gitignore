@@ -7,6 +7,8 @@ Cargo.lock
 *.pyc
 *.sage.py
 params
+figures/
+scripts/
 *.swp
 *.swo
 .vscode
