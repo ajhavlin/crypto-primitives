@@ -1,7 +1,7 @@
 #[cfg(feature = "constraints")]
 mod constraints;
-mod test_utils;
 mod delta_encoding_tests;
+mod test_utils;
 
 #[cfg(all(test, feature = "bench_harness"))]
 mod bench_report;
@@ -68,7 +68,13 @@ mod bytes_mt_tests {
             .unwrap();
 
         assert!(multi_proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), leaves.clone())
+            .verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &root,
+                tree.height(),
+                leaves.clone()
+            )
             .unwrap());
 
         // test merkle tree update functionality
@@ -93,7 +99,13 @@ mod bytes_mt_tests {
             .unwrap();
 
         assert!(multi_proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), leaves.clone())
+            .verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &root,
+                tree.height(),
+                leaves.clone()
+            )
             .unwrap());
     }
 
@@ -186,7 +198,7 @@ mod field_mt_tests {
             tests::test_utils::poseidon_parameters, Config, IdentityDigestConverter, MerkleTree,
         },
     };
-    use ark_std::{test_rng, UniformRand, One};
+    use ark_std::{test_rng, One, UniformRand};
 
     type F = ark_ed_on_bls12_381::Fr;
     type H = poseidon::CRH<F>;
@@ -227,7 +239,13 @@ mod field_mt_tests {
             .unwrap();
 
         assert!(multi_proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), leaves.clone())
+            .verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &root,
+                tree.height(),
+                leaves.clone()
+            )
             .unwrap());
 
         {
@@ -281,7 +299,13 @@ mod field_mt_tests {
             .unwrap();
 
         assert!(multi_proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), leaves.clone())
+            .verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &root,
+                tree.height(),
+                leaves.clone()
+            )
             .unwrap());
     }
 
@@ -309,7 +333,9 @@ mod field_mt_tests {
     #[test]
     fn multiproof_empty_batch_verifies() {
         let mut rng = test_rng();
-        let leaves: Vec<Vec<_>> = (0..4).map(|_| (0..3).map(|_| F::rand(&mut rng)).collect()).collect();
+        let leaves: Vec<Vec<_>> = (0..4)
+            .map(|_| (0..3).map(|_| F::rand(&mut rng)).collect())
+            .collect();
         let leaf_crh_params = poseidon_parameters();
         let two_to_one_params = leaf_crh_params.clone();
         let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
@@ -318,7 +344,13 @@ mod field_mt_tests {
         let proof = tree.generate_multi_proof(Vec::<usize>::new()).unwrap();
         assert!(
             proof
-                .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), Vec::<Vec<F>>::new())
+                .verify(
+                    &leaf_crh_params,
+                    &two_to_one_params,
+                    &root,
+                    tree.height(),
+                    Vec::<Vec<F>>::new()
+                )
                 .unwrap(),
             "empty batch proof should verify"
         );
@@ -328,7 +360,9 @@ mod field_mt_tests {
     #[test]
     fn multiproof_duplicate_indices_deduped() {
         let mut rng = test_rng();
-        let leaves: Vec<Vec<_>> = (0..8).map(|_| (0..3).map(|_| F::rand(&mut rng)).collect()).collect();
+        let leaves: Vec<Vec<_>> = (0..8)
+            .map(|_| (0..3).map(|_| F::rand(&mut rng)).collect())
+            .collect();
         let leaf_crh_params = poseidon_parameters();
         let two_to_one_params = leaf_crh_params.clone();
         let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
@@ -336,7 +370,11 @@ mod field_mt_tests {
 
         let indexes = vec![3usize, 1, 3, 1, 5];
         let proof = tree.generate_multi_proof(indexes.clone()).unwrap();
-        assert_eq!(proof.leaf_indexes, vec![1, 3, 5], "indexes should be sorted & deduped");
+        assert_eq!(
+            proof.leaf_indexes,
+            vec![1, 3, 5],
+            "indexes should be sorted & deduped"
+        );
 
         let opened: Vec<_> = proof
             .leaf_indexes
@@ -346,7 +384,13 @@ mod field_mt_tests {
 
         assert!(
             proof
-                .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), opened)
+                .verify(
+                    &leaf_crh_params,
+                    &two_to_one_params,
+                    &root,
+                    tree.height(),
+                    opened
+                )
                 .unwrap(),
             "proof with duplicate input indices should verify after deduplication"
         );
@@ -355,7 +399,9 @@ mod field_mt_tests {
     #[test]
     fn multiproof_wrong_leaf_copath_fails() {
         let mut rng = test_rng();
-        let leaves: Vec<Vec<_>> = (0..8).map(|_| (0..3).map(|_| F::rand(&mut rng)).collect()).collect();
+        let leaves: Vec<Vec<_>> = (0..8)
+            .map(|_| (0..3).map(|_| F::rand(&mut rng)).collect())
+            .collect();
         let leaf_crh_params = poseidon_parameters();
         let two_to_one_params = leaf_crh_params.clone();
         let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
@@ -373,7 +419,13 @@ mod field_mt_tests {
             .collect();
 
         let ok = bad
-            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), opened)
+            .verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &root,
+                tree.height(),
+                opened,
+            )
             .unwrap();
         assert!(!ok, "tampered leaf_copath digest must fail verification");
     }
@@ -381,7 +433,9 @@ mod field_mt_tests {
     #[test]
     fn multiproof_missing_inner_entry_fails() {
         let mut rng = test_rng();
-        let leaves: Vec<Vec<_>> = (0..16).map(|_| (0..3).map(|_| F::rand(&mut rng)).collect()).collect();
+        let leaves: Vec<Vec<_>> = (0..16)
+            .map(|_| (0..3).map(|_| F::rand(&mut rng)).collect())
+            .collect();
         let leaf_crh_params = poseidon_parameters();
         let two_to_one_params = leaf_crh_params.clone();
         let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
@@ -400,7 +454,13 @@ mod field_mt_tests {
             .map(|&i| leaves[i].clone())
             .collect();
         let ok = bad
-            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), opened)
+            .verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &root,
+                tree.height(),
+                opened,
+            )
             .unwrap();
         assert!(!ok, "missing inner copath entry must invalidate the proof");
     }
@@ -408,7 +468,9 @@ mod field_mt_tests {
     #[test]
     fn multiproof_open_order_robustness() {
         let mut rng = test_rng();
-        let leaves: Vec<Vec<_>> = (0..8).map(|_| (0..3).map(|_| F::rand(&mut rng)).collect()).collect();
+        let leaves: Vec<Vec<_>> = (0..8)
+            .map(|_| (0..3).map(|_| F::rand(&mut rng)).collect())
+            .collect();
         let leaf_crh_params = poseidon_parameters();
         let two_to_one_params = leaf_crh_params.clone();
         let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
@@ -425,26 +487,36 @@ mod field_mt_tests {
             .collect();
         assert!(
             proof
-                .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), ordered_leaves.clone())
+                .verify(
+                    &leaf_crh_params,
+                    &two_to_one_params,
+                    &root,
+                    tree.height(),
+                    ordered_leaves.clone()
+                )
                 .unwrap(),
             "proof should verify when leaves follow proof.leaf_indexes order"
         );
 
         // providing leaves in shuffled query order should fail
-        let shuffled_leaves: Vec<_> = indexes
-            .iter()
-            .map(|&i| leaves[i].clone())
-            .collect();
+        let shuffled_leaves: Vec<_> = indexes.iter().map(|&i| leaves[i].clone()).collect();
         let ok = proof
-            .verify(&leaf_crh_params, &two_to_one_params, &root, tree.height(), shuffled_leaves)
+            .verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &root,
+                tree.height(),
+                shuffled_leaves,
+            )
             .unwrap();
         assert!(!ok, "mismatched leaf ordering must fail verification");
     }
-
 }
 
 mod delta_encoding_spacing_tests {
-    use super::super::{decode_delta, CoPath, Config, IdentityDigestConverter, CRHScheme, TwoToOneCRHScheme};
+    use super::super::{
+        decode_delta, CRHScheme, CoPath, Config, IdentityDigestConverter, TwoToOneCRHScheme,
+    };
     use ark_std::borrow::Borrow;
 
     struct DummyCfg;
@@ -463,7 +535,9 @@ mod delta_encoding_spacing_tests {
         type Output = u8;
         type Parameters = ();
 
-        fn setup<R: ark_std::rand::Rng>(_rng: &mut R) -> Result<Self::Parameters, super::super::Error> {
+        fn setup<R: ark_std::rand::Rng>(
+            _rng: &mut R,
+        ) -> Result<Self::Parameters, super::super::Error> {
             Ok(())
         }
 
@@ -481,7 +555,9 @@ mod delta_encoding_spacing_tests {
         type Output = u8;
         type Parameters = ();
 
-        fn setup<R: ark_std::rand::Rng>(_rng: &mut R) -> Result<Self::Parameters, super::super::Error> {
+        fn setup<R: ark_std::rand::Rng>(
+            _rng: &mut R,
+        ) -> Result<Self::Parameters, super::super::Error> {
             Ok(())
         }
 
@@ -508,7 +584,7 @@ mod delta_encoding_spacing_tests {
         // between consecutive coordinates in this order (not relative to a global heap index).
         //
         // This test demonstrates the worst case spaced openings scenario at the leaf level, plus a
-        // higher-layer sibling at depth d-2. 
+        // higher-layer sibling at depth d-2.
         let d: usize = 14;
         let depth_inner = d - 2;
         let depth_leaf = d - 1;

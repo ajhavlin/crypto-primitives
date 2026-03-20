@@ -8,12 +8,14 @@ use crate::{
     sponge::Absorb,
     Error,
 };
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Read, SerializationError, Valid, Validate};
+use ark_serialize::{
+    CanonicalDeserialize, CanonicalSerialize, Compress, Read, SerializationError, Valid, Validate,
+};
 #[cfg(not(feature = "std"))]
 use ark_std::vec::Vec;
 use ark_std::{
     borrow::Borrow,
-    collections::{BTreeSet, BTreeMap},
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     hash::{BuildHasherDefault, Hash},
 };
@@ -235,9 +237,9 @@ impl<P: Config> Path<P> {
 ///     `leaf_copath`: `[]`
 ///     `inner_copath`: `[(2,0,D), (1,1,C)]` (store packed as `(2,0,[1,+1],[D,C])`)
 ///     `leaf_indexes` is: `[2,3]` (indexes in Merkle Tree leaves vector)
-/// 
+///
 ///  We can reconstruct upfront the minimal copath needed for the proof:
-///  First, we reconstruct the minimal copath at the leaf layer (`depth = tree_height-1`). 
+///  First, we reconstruct the minimal copath at the leaf layer (`depth = tree_height-1`).
 ///  This is only those sibling leaf digests that are required to complete parents of on-path leaves but are not themselves on-path.
 ///  The leaf copath is thus `[J,I]/[I,J]=[]`.
 ///  We then repeat this for each inner layer, computing only the non-on-path siblings needed to complete parents of the union of all single paths.
@@ -268,7 +270,7 @@ impl<P: Config> Valid for CoPath<P> {
         if self.tree_height < 2 {
             return Err(SerializationError::InvalidData);
         }
-        /// propagate each fields validity check to ensure the entire structure is valid
+        // Propagate field checks to ensure the whole structure is valid.
         self.leaf_copath.check()?;
         self.inner_copath.check()?;
         self.leaf_indexes.check()
@@ -286,12 +288,16 @@ impl<P: Config> CanonicalDeserialize for CoPath<P> {
             Vec::<P::LeafDigest>::deserialize_with_mode(&mut reader, compress, validate)?;
         let inner_copath =
             Option::<PackedInnerCopath<P>>::deserialize_with_mode(&mut reader, compress, validate)?;
-        let leaf_indexes =
-            Vec::<usize>::deserialize_with_mode(&mut reader, compress, validate)?;
+        let leaf_indexes = Vec::<usize>::deserialize_with_mode(&mut reader, compress, validate)?;
         if tree_height < 2 {
             return Err(SerializationError::InvalidData);
         }
-        Ok(CoPath { tree_height, leaf_copath, inner_copath, leaf_indexes })
+        Ok(CoPath {
+            tree_height,
+            leaf_copath,
+            inner_copath,
+            leaf_indexes,
+        })
     }
 }
 
@@ -311,15 +317,21 @@ impl<P: Config> CoPath<P> {
         leaves: impl IntoIterator<Item = L>,
     ) -> Result<bool, crate::Error> {
         if self.leaf_indexes.is_empty() {
-            return Err(crate::Error::GenericError(
-                "batch proof must contain at least one leaf index".into()
-            ));
+            return Err(crate::Error::GenericError(ark_std::boxed::Box::new(
+                ark_std::io::Error::new(
+                    ark_std::io::ErrorKind::InvalidInput,
+                    "batch proof must contain at least one leaf index",
+                ),
+            )));
         }
 
         if self.tree_height < 2 {
-            return Err(crate::Error::GenericError(
-                "tree_height must be >= 2".into()
-            ));
+            return Err(crate::Error::GenericError(ark_std::boxed::Box::new(
+                ark_std::io::Error::new(
+                    ark_std::io::ErrorKind::InvalidInput,
+                    "tree_height must be >= 2",
+                ),
+            )));
         }
 
         if self.tree_height != expected_tree_height {
@@ -343,7 +355,7 @@ impl<P: Config> CoPath<P> {
         if !Self::validate_leaf_copath(&expected_leaf_coset, &self.leaf_copath, &mut leaf_level) {
             return Ok(false);
         }
-        
+
         // prepare inner-level maps for non-on-path siblings and computed parents
         let mut inner_levels: Vec<BTreeMap<usize, P::InnerDigest>> =
             (0..d).map(|_| BTreeMap::new()).collect();
@@ -385,11 +397,11 @@ impl<P: Config> CoPath<P> {
         }
     }
 
-    /// Encodes the inner co-path entries [(depth, index, digest), ...] as compact delta encodings. 
+    /// Encodes the inner co-path entries [(depth, index, digest), ...] as compact delta encodings.
     /// Keeps the first (depth, index) entry, then zigzag encodes signed deltas of subsequent paris,
-    /// collecting the corresponding digests in order. 
+    /// collecting the corresponding digests in order.
     /// Result is a tuple (start_depth: usize, start_index: usize, deltas: Vec<u8>, digests: Vec<<P as Config>::InnerDigest>)
-    /// 
+    ///
     /// For example:
     /// ```tree_diagram
     ///                         [A]                           d = 0
@@ -400,9 +412,9 @@ impl<P: Config> CoPath<P> {
     ///              / \    / \     / \    / \
     ///            H   I  [J]  K   L  [M]  N   O              d = 3
     ///           / \ / \ / \ / \ / \ / \ / \ / \
-    ///              .... 4 5 6 7 8 9 10 11 ....              d = 4 
+    ///              .... 4 5 6 7 8 9 10 11 ....              d = 4
     /// ```
-    /// 
+    ///
     ///  Suppose we want to prove the following openings:
     /// ```text
     ///  I = {6, 8}
@@ -418,13 +430,13 @@ impl<P: Config> CoPath<P> {
     ///  * `6` inner-layer digests (`inner_copath`),
     ///
     ///  We keep `leaf_copath` as-is but instead of storing all 6 `(depth, index)` pairs explicitly, we store:
-    /// 
+    ///
     ///  * a starting coordinate:
     /// ```text
     ///  start_depth = 1
     ///  start_index = 0
     /// ```
-    /// 
+    ///
     ///  * followed by signed deltas between consecutive coordinates:
     /// ```text
     ///  (Δd, Δi) sequence:
@@ -438,7 +450,7 @@ impl<P: Config> CoPath<P> {
     ///  Each `(Δd, Δi)` is encoded to unsigned and then varint-encoded. All of these
     ///  deltas are very small (−1, 0, +1, +3), so each encoded value fits in a
     ///  single byte. On a 64-bit platform:
-    /// 
+    ///
     ///  * naive coordinate encoding for 6 entries as `(depth: usize, index: usize)`
     ///    uses roughly `6 × 2 × 8 = 96` bytes,
     ///  * the packed representation uses:
@@ -576,11 +588,7 @@ impl<P: Config> CoPath<P> {
                     (Some(left), Some(right)) => (left, right),
                     _ => return Ok(false),
                 };
-                let parent = P::TwoToOneHash::compress(
-                    two_to_one_params, 
-                    &left, 
-                    &right,
-                )?;
+                let parent = P::TwoToOneHash::compress(two_to_one_params, &left, &right)?;
                 inner_levels[parent_depth].insert(parent_index, parent.clone());
                 // add parent to LUT at heap index
                 let heap_idx = level_index(parent_depth, parent_index);
@@ -591,7 +599,7 @@ impl<P: Config> CoPath<P> {
     }
 
     /// Decodes inner co-path entries back into their usize equivalents
-    /// Inserts corresponding digest into the LUT for memoisation. 
+    /// Inserts corresponding digest into the LUT for memoisation.
     fn decode_inner_copath(
         tree_height: usize,
         inner_copath: &Option<PackedInnerCopath<P>>,
@@ -599,7 +607,7 @@ impl<P: Config> CoPath<P> {
         hash_lut: &mut HashMap<usize, P::InnerDigest, BuildHasherDefault<DefaultHasher>>,
     ) -> bool {
         if let Some((start_depth, start_index, deltas, digests)) = inner_copath {
-            // verifier rejects if remaining deltas with empty digests 
+            // verifier rejects if remaining deltas with empty digests
             if digests.is_empty() {
                 return deltas.is_empty();
             }
@@ -616,7 +624,7 @@ impl<P: Config> CoPath<P> {
             let mut cursor = 0usize;
             let mut prev_coord: Option<(usize, usize)> = None;
 
-            // Helper to insert digest into the LUT 
+            // Helper to insert digest into the LUT
             let mut push_entry =
                 |depth_i64: i64, index_i64: i64, digest: &P::InnerDigest| -> bool {
                     let depth_usize = match usize::try_from(depth_i64) {
@@ -636,7 +644,7 @@ impl<P: Config> CoPath<P> {
                             return false;
                         }
                     }
-                    // check for conflicting siblings at the same coordinate 
+                    // check for conflicting siblings at the same coordinate
                     if let Some(existing) = inner_levels[depth_usize].get(&index_usize) {
                         if existing != digest {
                             return false;
@@ -655,7 +663,7 @@ impl<P: Config> CoPath<P> {
                 return false;
             }
 
-            // accumulate remaining digests 
+            // accumulate remaining digests
             for digest in digests.iter().skip(1) {
                 let depth_delta = match decode_delta(deltas, &mut cursor) {
                     Some(delta) => delta,
@@ -936,21 +944,21 @@ impl<P: Config> MerkleTree<P> {
         })
     }
 
-    /// Returns a CoPath struct (a compressed membership proof for a set of leaves), 
+    /// Returns a CoPath struct (a compressed membership proof for a set of leaves),
     /// sufficient to verify each leaf up to the root.
     /// Indexes are internally sorted and emitted in this order.
-    /// 
+    ///
     /// With the CoSet (minimal co-path) encoding, we do not store full per-leaf authentication paths.
-    /// Instead we collect, for each tree level, only those siblings of on-path nodes that are not themselves on-path. 
+    /// Instead we collect, for each tree level, only those siblings of on-path nodes that are not themselves on-path.
     /// This yields a smaller proof than front-incremental prefix encoding in the typical case,
     /// while preserving the same verification interface.
-    /// 
+    ///
     /// For sorted indexes, the CoSet proof carries:
     /// * `tree_height`;
     /// * `leaf_indexes` (ascending, unique);
     /// * `leaf_copath`: the leaf-layer co-path digests `B*_{d-1}`, in ascending sibling index order;
     /// * `inner_copath`: the inner co-path packed as `(start_depth, start_index, packed deltas, digests)`.
-    /// 
+    ///
     /// When verifying the proof, leaves hashes should be supplied in order of `leaf_indexes`, that is:
     /// ```text
     /// let ordered_leaves: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
@@ -1006,10 +1014,9 @@ impl<P: Config> MerkleTree<P> {
                 let sibling_idx = path_idx ^ 1;
                 if on_path[depth].binary_search(&sibling_idx).is_err() {
                     let heap_idx = level_index(depth, sibling_idx);
-                    let sibling_digest = self
-                        .non_leaf_nodes
-                        .get(heap_idx)
-                        .ok_or_else(|| crate::Error::IncorrectInputLength(self.non_leaf_nodes.len()))?;
+                    let sibling_digest = self.non_leaf_nodes.get(heap_idx).ok_or_else(|| {
+                        crate::Error::IncorrectInputLength(self.non_leaf_nodes.len())
+                    })?;
                     inner_copath_entries.push((depth, sibling_idx, sibling_digest.clone()));
                 }
             }
@@ -1236,7 +1243,7 @@ fn decode_varint(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
 
 /// Build the on-path sets A_j from the (sorted, unique) leaf index set I and the leaf depth `d-1`.
 /// A_j contains 0-based indices at depth j that lie on the union of all single paths from I to the root.
-/// 
+///
 /// Implementation detail:
 /// * Uses sorted `Vec<usize>` per level to keep the hot loops linear and cache-friendly.
 /// * Each leaf contributes one index per depth; we divide by 2 as we walk up and then sort+dedup.

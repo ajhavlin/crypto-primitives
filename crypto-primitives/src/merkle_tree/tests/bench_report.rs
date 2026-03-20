@@ -1,5 +1,6 @@
 #![cfg(feature = "bench_harness")]
 
+use super::super::{decode_delta, encode_varint};
 use crate::merkle_tree::{
     legacy, tests::test_utils::poseidon_parameters, CoPath, Config, IdentityDigestConverter,
     LeafParam, MerkleTree, TwoToOneParam,
@@ -51,6 +52,22 @@ type LegacyTwoToOneParam = legacy::TwoToOneParam<LegacyFieldMTConfig>;
 const TREE_EXPONENTS: &[u32] = &[12, 14, 16, 18, 20];
 const BATCH_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 const LEAF_WIDTH: usize = 3;
+const COORD_TREE_EXPONENTS: &[u32] = &[18];
+
+#[derive(Clone, Copy)]
+enum CoordinateEncoding {
+    Natural,
+    Leb128Index,
+}
+
+impl CoordinateEncoding {
+    fn label(self) -> &'static str {
+        match self {
+            CoordinateEncoding::Natural => "natural",
+            CoordinateEncoding::Leb128Index => "leb128",
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum IndexPattern {
@@ -108,6 +125,22 @@ struct PlotMetric {
     value: fn(&ReportRow) -> Option<f64>,
 }
 
+struct CoordinateSizeRow {
+    tree_size: usize,
+    log2_size: u32,
+    batch: usize,
+    pattern: &'static str,
+    strategy: &'static str,
+    proof_bytes: usize,
+    proof_nodes: usize,
+}
+
+struct InnerEntry<'a, D> {
+    depth: usize,
+    index: usize,
+    digest: &'a D,
+}
+
 trait ProofStats {
     fn opened(&self) -> usize;
     fn total_nodes(&self) -> usize;
@@ -119,7 +152,11 @@ impl<P: Config> ProofStats for CoPath<P> {
     }
 
     fn total_nodes(&self) -> usize {
-        let inner = self.inner_copath.as_ref().map(|(_, _, _, digests)| digests.len()).unwrap_or(0);
+        let inner = self
+            .inner_copath
+            .as_ref()
+            .map(|(_, _, _, digests)| digests.len())
+            .unwrap_or(0);
         self.leaf_copath.len() + inner
     }
 }
@@ -130,11 +167,7 @@ impl<P: legacy::Config> ProofStats for legacy::MultiPath<P> {
     }
 
     fn total_nodes(&self) -> usize {
-        let auth_len: usize = self
-            .auth_paths_suffixes
-            .iter()
-            .map(|path| path.len())
-            .sum();
+        let auth_len: usize = self.auth_paths_suffixes.iter().map(|path| path.len()).sum();
         self.leaf_siblings_hashes.len() + auth_len
     }
 }
@@ -164,6 +197,18 @@ const PLOT_METRICS: &[PlotMetric] = &[
 #[ignore]
 fn multiproof_v2_benchmark_report() {
     run_report().expect("benchmark report must succeed");
+}
+
+#[test]
+#[ignore]
+fn coordinate_encoding_proof_size_report() {
+    run_coordinate_report().expect("coordinate encoding report must succeed");
+}
+
+#[test]
+#[ignore]
+fn leb128_vs_delta_proof_size_report() {
+    run_leb128_vs_delta_report().expect("leb128 vs delta report must succeed");
 }
 
 fn run_report() -> Result<(), Box<dyn std::error::Error>> {
@@ -205,6 +250,115 @@ fn run_report() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn run_coordinate_report() -> Result<(), Box<dyn std::error::Error>> {
+    let mut fixtures = Vec::new();
+    for &exp in COORD_TREE_EXPONENTS {
+        fixtures.push(build_fixture(exp)?);
+    }
+
+    let patterns = [IndexPattern::Random, IndexPattern::Clustered];
+    let encodings = [CoordinateEncoding::Natural, CoordinateEncoding::Leb128Index];
+
+    let mut rows = Vec::new();
+    for fixture in fixtures.iter() {
+        for &batch in BATCH_SIZES {
+            if batch > fixture.leaves.len() {
+                continue;
+            }
+            for &pattern in &patterns {
+                let mut scenario_rng = StdRng::seed_from_u64(
+                    0xC0DE_1280_u64
+                        ^ ((fixture.leaves.len() as u64) << 16)
+                        ^ ((batch as u64) << 2)
+                        ^ pattern.id(),
+                );
+                let indexes =
+                    sample_indexes(pattern, batch, fixture.leaves.len(), &mut scenario_rng);
+                let proof = fixture.tree.generate_multi_proof(indexes.iter().copied())?;
+                let proof_nodes = proof.total_nodes();
+
+                for &encoding in &encodings {
+                    rows.push(CoordinateSizeRow {
+                        tree_size: fixture.leaves.len(),
+                        log2_size: fixture.log2_size(),
+                        batch,
+                        pattern: pattern.label(),
+                        strategy: encoding.label(),
+                        proof_bytes: serialized_coordinate_proof_size(&proof, encoding),
+                        proof_nodes,
+                    });
+                }
+            }
+        }
+    }
+
+    let report_dir = PathBuf::from("target/merkle_tree_reports");
+    fs::create_dir_all(&report_dir)?;
+    let plot_files = write_coordinate_plots(&rows, &report_dir)?;
+    write_coordinate_report(&rows, &report_dir, &plot_files)?;
+    write_coordinate_rows_csv(&rows, &report_dir)?;
+    Ok(())
+}
+
+fn run_leb128_vs_delta_report() -> Result<(), Box<dyn std::error::Error>> {
+    let mut fixtures = Vec::new();
+    for &exp in COORD_TREE_EXPONENTS {
+        fixtures.push(build_fixture(exp)?);
+    }
+
+    let patterns = [IndexPattern::Random, IndexPattern::Clustered];
+    let mut rows = Vec::new();
+
+    for fixture in fixtures.iter() {
+        for &batch in BATCH_SIZES {
+            if batch > fixture.leaves.len() {
+                continue;
+            }
+            for &pattern in &patterns {
+                let mut scenario_rng = StdRng::seed_from_u64(
+                    0xD37A_1280_u64
+                        ^ ((fixture.leaves.len() as u64) << 16)
+                        ^ ((batch as u64) << 2)
+                        ^ pattern.id(),
+                );
+                let indexes =
+                    sample_indexes(pattern, batch, fixture.leaves.len(), &mut scenario_rng);
+                let proof = fixture.tree.generate_multi_proof(indexes.iter().copied())?;
+                let proof_nodes = proof.total_nodes();
+
+                rows.push(CoordinateSizeRow {
+                    tree_size: fixture.leaves.len(),
+                    log2_size: fixture.log2_size(),
+                    batch,
+                    pattern: pattern.label(),
+                    strategy: "leb128",
+                    proof_bytes: serialized_coordinate_proof_size(
+                        &proof,
+                        CoordinateEncoding::Leb128Index,
+                    ),
+                    proof_nodes,
+                });
+                rows.push(CoordinateSizeRow {
+                    tree_size: fixture.leaves.len(),
+                    log2_size: fixture.log2_size(),
+                    batch,
+                    pattern: pattern.label(),
+                    strategy: "delta",
+                    proof_bytes: serialized_size(&proof),
+                    proof_nodes,
+                });
+            }
+        }
+    }
+
+    let report_dir = PathBuf::from("target/merkle_tree_reports");
+    fs::create_dir_all(&report_dir)?;
+    let plot_files = write_leb128_vs_delta_plots(&rows, &report_dir)?;
+    write_leb128_vs_delta_report(&rows, &report_dir, &plot_files)?;
+    write_leb128_vs_delta_rows_csv(&rows, &report_dir)?;
+    Ok(())
+}
+
 fn run_scenario(
     fixture: &TreeFixture,
     batch: usize,
@@ -217,7 +371,11 @@ fn run_scenario(
 
     let legacy_row = benchmark_strategy(
         "prefix",
-        || fixture.legacy_tree.generate_multi_proof(indexes.iter().copied()),
+        || {
+            fixture
+                .legacy_tree
+                .generate_multi_proof(indexes.iter().copied())
+        },
         |proof: &legacy::MultiPath<_>, leaves| {
             proof.verify(
                 &fixture.legacy_leaf_params,
@@ -236,12 +394,15 @@ fn run_scenario(
     let coset_row = benchmark_strategy(
         "coset",
         || fixture.tree.generate_multi_proof(indexes.iter().copied()),
-        |proof: &CoPath<_>, leaves| proof.verify(
-            &fixture.leaf_params,
-            &fixture.two_to_one_params,
-            &root,
-            leaves,
-        ),
+        |proof: &CoPath<_>, leaves| {
+            proof.verify(
+                &fixture.leaf_params,
+                &fixture.two_to_one_params,
+                &root,
+                fixture.tree.height(),
+                leaves,
+            )
+        },
         &opened_leaves,
         fixture.leaves.len(),
         fixture.log2_size(),
@@ -419,8 +580,163 @@ fn write_report(
         }
         writeln!(file, "\n## {} Visualizations\n", metric)?;
         for plot in files {
-            writeln!(file, "![{}]({})", metric.replace(' ', "-").to_lowercase(), plot)?;
+            writeln!(
+                file,
+                "![{}]({})",
+                metric.replace(' ', "-").to_lowercase(),
+                plot
+            )?;
         }
+    }
+
+    Ok(())
+}
+
+fn write_coordinate_report(
+    rows: &[CoordinateSizeRow],
+    report_dir: &Path,
+    plot_files: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path = report_dir.join("coordinate_encoding_report.md");
+    let mut file = File::create(&report_path)?;
+
+    writeln!(file, "# Merkle Tree Proof Size Comparison")?;
+    writeln!(
+        file,
+        "\nGenerated: {:?}\n",
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
+    )?;
+    writeln!(
+        file,
+        "| tree_n | log2(n) | batch_k | pattern | strategy | proof_bytes | proof_nodes |"
+    )?;
+    writeln!(
+        file,
+        "| ------ | ------- | ------- | ------- | -------- | ----------- | ----------- |"
+    )?;
+
+    for row in rows {
+        writeln!(
+            file,
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            row.tree_size,
+            row.log2_size,
+            row.batch,
+            row.pattern,
+            row.strategy,
+            row.proof_bytes,
+            row.proof_nodes,
+        )?;
+    }
+
+    if !plot_files.is_empty() {
+        writeln!(file, "\n## Figures\n")?;
+        for plot in plot_files {
+            writeln!(file, "![coordinate-proof-size]({})", plot)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_coordinate_rows_csv(
+    rows: &[CoordinateSizeRow],
+    report_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let csv_path = report_dir.join("coordinate_encoding_rows.csv");
+    let mut file = File::create(&csv_path)?;
+    writeln!(
+        file,
+        "tree_size,log2_size,batch,pattern,strategy,proof_bytes,proof_nodes"
+    )?;
+
+    for row in rows {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{}",
+            row.tree_size,
+            row.log2_size,
+            row.batch,
+            row.pattern,
+            row.strategy,
+            row.proof_bytes,
+            row.proof_nodes,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_leb128_vs_delta_report(
+    rows: &[CoordinateSizeRow],
+    report_dir: &Path,
+    plot_files: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path = report_dir.join("leb128_vs_delta_report.md");
+    let mut file = File::create(&report_path)?;
+
+    writeln!(file, "# Merkle Tree Proof Size Comparison")?;
+    writeln!(
+        file,
+        "\nGenerated: {:?}\n",
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
+    )?;
+    writeln!(
+        file,
+        "| tree_n | log2(n) | batch_k | pattern | strategy | proof_bytes | proof_nodes |"
+    )?;
+    writeln!(
+        file,
+        "| ------ | ------- | ------- | ------- | -------- | ----------- | ----------- |"
+    )?;
+
+    for row in rows {
+        writeln!(
+            file,
+            "| {} | {} | {} | {} | {} | {} | {} |",
+            row.tree_size,
+            row.log2_size,
+            row.batch,
+            row.pattern,
+            row.strategy,
+            row.proof_bytes,
+            row.proof_nodes,
+        )?;
+    }
+
+    if !plot_files.is_empty() {
+        writeln!(file, "\n## Figures\n")?;
+        for plot in plot_files {
+            writeln!(file, "![leb128-vs-delta]({})", plot)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_leb128_vs_delta_rows_csv(
+    rows: &[CoordinateSizeRow],
+    report_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let csv_path = report_dir.join("leb128_vs_delta_rows.csv");
+    let mut file = File::create(&csv_path)?;
+    writeln!(
+        file,
+        "tree_size,log2_size,batch,pattern,strategy,proof_bytes,proof_nodes"
+    )?;
+
+    for row in rows {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{}",
+            row.tree_size,
+            row.log2_size,
+            row.batch,
+            row.pattern,
+            row.strategy,
+            row.proof_bytes,
+            row.proof_nodes,
+        )?;
     }
 
     Ok(())
@@ -460,8 +776,7 @@ fn write_plots(
                 }
             }
 
-            if ordered_series.len() < 2
-                || !ordered_series.iter().any(|(name, _)| *name == "prefix")
+            if ordered_series.len() < 2 || !ordered_series.iter().any(|(name, _)| *name == "prefix")
             {
                 continue;
             }
@@ -486,10 +801,7 @@ fn write_plots(
             let x_pad = ((max_x - min_x) * 0.05).max(1.0);
             let y_pad = ((max_y - min_y) * 0.05).max(1.0);
 
-            let filename = format!(
-                "{}_{}_{}.svg",
-                metric.filename_prefix, tree_size, pattern
-            );
+            let filename = format!("{}_{}_{}.svg", metric.filename_prefix, tree_size, pattern);
             let filepath = report_dir.join(&filename);
             let filepath_str = filepath.to_string_lossy().to_string();
             let drawing_area = SVGBackend::new(&filepath_str, (960, 540)).into_drawing_area();
@@ -497,8 +809,11 @@ fn write_plots(
 
             let mut chart = ChartBuilder::on(&drawing_area)
                 .caption(
-                    format!("{} vs k (n={}, pattern={})", metric.name, tree_size, pattern),
-                    ("sans-serif", 26),
+                    format!(
+                        "{} vs k (n={}, pattern={})",
+                        metric.name, tree_size, pattern
+                    ),
+                    ("Helvetica Neue", 26).into_font().style(FontStyle::Bold),
                 )
                 .margin(20)
                 .x_label_area_size(45)
@@ -525,7 +840,10 @@ fn write_plots(
                     });
             }
 
-            chart.configure_series_labels().border_style(&BLACK).draw()?;
+            chart
+                .configure_series_labels()
+                .border_style(&BLACK)
+                .draw()?;
 
             generated.push(filename);
         }
@@ -536,11 +854,257 @@ fn write_plots(
     Ok(outputs)
 }
 
+fn write_coordinate_plots(
+    rows: &[CoordinateSizeRow],
+    report_dir: &Path,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut grouped: BTreeMap<(usize, &'static str), BTreeMap<&'static str, Vec<(f64, f64)>>> =
+        BTreeMap::new();
+
+    for row in rows {
+        grouped
+            .entry((row.tree_size, row.pattern))
+            .or_default()
+            .entry(row.strategy)
+            .or_default()
+            .push((row.batch as f64, row.proof_bytes as f64));
+    }
+
+    let mut generated = Vec::new();
+    for ((tree_size, pattern), strategies) in grouped {
+        let mut ordered_series: Vec<(&'static str, Vec<(f64, f64)>)> = Vec::new();
+        for &name in &["natural", "leb128"] {
+            if let Some(mut series) = strategies.get(name).cloned() {
+                if series.is_empty() {
+                    continue;
+                }
+                series.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                ordered_series.push((name, series));
+            }
+        }
+
+        if ordered_series.len() < 2 {
+            continue;
+        }
+
+        let mut min_x = f64::MAX;
+        let mut max_x = f64::MIN;
+        let mut min_y = f64::MAX;
+        let mut max_y = f64::MIN;
+        for (_, series) in &ordered_series {
+            for &(x, y) in series {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+        if min_x == f64::MAX || min_y == f64::MAX {
+            continue;
+        }
+
+        let x_pad = ((max_x - min_x) * 0.06).max(8.0);
+        let y_pad = ((max_y - min_y) * 0.10).max(256.0);
+
+        let filename = format!("coordinate_proof_size_{}_{}.svg", tree_size, pattern);
+        let filepath = report_dir.join(&filename);
+        let filepath_str = filepath.to_string_lossy().to_string();
+        let drawing_area = SVGBackend::new(&filepath_str, (1280, 720)).into_drawing_area();
+        drawing_area.fill(&WHITE)?;
+
+        let mut chart = ChartBuilder::on(&drawing_area)
+            .margin(28)
+            .x_label_area_size(64)
+            .y_label_area_size(96)
+            .build_cartesian_2d(
+                (min_x - x_pad)..(max_x + x_pad),
+                (min_y - y_pad)..(max_y + y_pad),
+            )?;
+
+        chart
+            .configure_mesh()
+            .x_desc("input size k (opened leaves)")
+            .y_desc("proof size (bytes)")
+            .axis_desc_style(("Helvetica Neue", 24).into_font().style(FontStyle::Bold))
+            .label_style(("Helvetica Neue", 18).into_font())
+            .light_line_style(WHITE.mix(0.0))
+            .draw()?;
+
+        for (name, series) in &ordered_series {
+            let color = coordinate_strategy_color(name);
+            chart
+                .draw_series(LineSeries::new(series.clone(), color.stroke_width(4)))?
+                .label(coordinate_strategy_label(name))
+                .legend({
+                    let color = color.clone();
+                    move |(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], color.stroke_width(4))
+                });
+
+            chart.draw_series(
+                series
+                    .iter()
+                    .map(|point| Circle::new(*point, 5, color.filled())),
+            )?;
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.85))
+            .border_style(BLACK)
+            .label_font(("Helvetica Neue", 22).into_font().style(FontStyle::Bold))
+            .draw()?;
+
+        generated.push(filename);
+    }
+
+    Ok(generated)
+}
+
+fn write_leb128_vs_delta_plots(
+    rows: &[CoordinateSizeRow],
+    report_dir: &Path,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut grouped: BTreeMap<(usize, &'static str), BTreeMap<&'static str, Vec<(f64, f64)>>> =
+        BTreeMap::new();
+
+    for row in rows {
+        grouped
+            .entry((row.tree_size, row.pattern))
+            .or_default()
+            .entry(row.strategy)
+            .or_default()
+            .push((row.batch as f64, row.proof_bytes as f64));
+    }
+
+    let mut generated = Vec::new();
+    for ((tree_size, pattern), strategies) in grouped {
+        let mut ordered_series: Vec<(&'static str, Vec<(f64, f64)>)> = Vec::new();
+        for &name in &["leb128", "delta"] {
+            if let Some(mut series) = strategies.get(name).cloned() {
+                if series.is_empty() {
+                    continue;
+                }
+                series.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                ordered_series.push((name, series));
+            }
+        }
+
+        if ordered_series.len() < 2 {
+            continue;
+        }
+
+        let mut min_x = f64::MAX;
+        let mut max_x = f64::MIN;
+        let mut min_y = f64::MAX;
+        let mut max_y = f64::MIN;
+        for (_, series) in &ordered_series {
+            for &(x, y) in series {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+        if min_x == f64::MAX || min_y == f64::MAX {
+            continue;
+        }
+
+        let x_pad = ((max_x - min_x) * 0.06).max(8.0);
+        let y_pad = ((max_y - min_y) * 0.10).max(256.0);
+
+        let filename = format!("leb128_vs_delta_proof_size_{}_{}.svg", tree_size, pattern);
+        let filepath = report_dir.join(&filename);
+        let filepath_str = filepath.to_string_lossy().to_string();
+        let drawing_area = SVGBackend::new(&filepath_str, (1280, 720)).into_drawing_area();
+        drawing_area.fill(&WHITE)?;
+
+        let mut chart = ChartBuilder::on(&drawing_area)
+            .margin(28)
+            .x_label_area_size(64)
+            .y_label_area_size(96)
+            .build_cartesian_2d(
+                (min_x - x_pad)..(max_x + x_pad),
+                (min_y - y_pad)..(max_y + y_pad),
+            )?;
+
+        chart
+            .configure_mesh()
+            .x_desc("input size k (opened leaves)")
+            .y_desc("proof size (bytes)")
+            .axis_desc_style(("Helvetica Neue", 24).into_font().style(FontStyle::Bold))
+            .label_style(("Helvetica Neue", 18).into_font())
+            .light_line_style(WHITE.mix(0.0))
+            .draw()?;
+
+        for (name, series) in &ordered_series {
+            let color = leb128_vs_delta_color(name);
+            chart
+                .draw_series(LineSeries::new(series.clone(), color.stroke_width(4)))?
+                .label(leb128_vs_delta_label(name))
+                .legend({
+                    let color = color.clone();
+                    move |(x, y)| PathElement::new(vec![(x, y), (x + 28, y)], color.stroke_width(4))
+                });
+
+            chart.draw_series(
+                series
+                    .iter()
+                    .map(|point| Circle::new(*point, 5, color.filled())),
+            )?;
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.85))
+            .border_style(BLACK)
+            .label_font(("Helvetica Neue", 22).into_font().style(FontStyle::Bold))
+            .draw()?;
+
+        generated.push(filename);
+    }
+
+    Ok(generated)
+}
+
 fn strategy_label(name: &str) -> &str {
     match name {
         "prefix" => "prefix",
         "coset" => "coset",
         _ => name,
+    }
+}
+
+fn coordinate_strategy_label(name: &str) -> &str {
+    match name {
+        "natural" => "Unoptimized",
+        "leb128" => "Partially Optimized",
+        _ => name,
+    }
+}
+
+fn coordinate_strategy_color(name: &str) -> RGBColor {
+    match name {
+        "natural" => RGBColor(217, 95, 2),
+        "leb128" => RGBColor(27, 158, 119),
+        _ => BLACK,
+    }
+}
+
+fn leb128_vs_delta_label(name: &str) -> &str {
+    match name {
+        "leb128" => "Partially Optimized",
+        "delta" => "Optimized",
+        _ => name,
+    }
+}
+
+fn leb128_vs_delta_color(name: &str) -> RGBColor {
+    match name {
+        "leb128" => RGBColor(27, 158, 119),
+        "delta" => RGBColor(117, 112, 179),
+        _ => BLACK,
     }
 }
 
@@ -594,6 +1158,110 @@ fn serialized_size<T: CanonicalSerialize>(value: &T) -> usize {
         .serialize_uncompressed(&mut buf)
         .expect("serialization must succeed");
     buf.len()
+}
+
+fn serialized_coordinate_proof_size<P: Config>(
+    proof: &CoPath<P>,
+    encoding: CoordinateEncoding,
+) -> usize {
+    let mut buf = Vec::new();
+    proof
+        .tree_height
+        .serialize_uncompressed(&mut buf)
+        .expect("tree height serialization must succeed");
+    proof
+        .leaf_copath
+        .serialize_uncompressed(&mut buf)
+        .expect("leaf co-path serialization must succeed");
+    serialize_inner_copath_absolute(&mut buf, proof, encoding);
+    proof
+        .leaf_indexes
+        .serialize_uncompressed(&mut buf)
+        .expect("leaf indexes serialization must succeed");
+    buf.len()
+}
+
+fn serialize_inner_copath_absolute<P: Config>(
+    buf: &mut Vec<u8>,
+    proof: &CoPath<P>,
+    encoding: CoordinateEncoding,
+) {
+    let entries = unpack_inner_entries(proof);
+    (!entries.is_empty())
+        .serialize_uncompressed(&mut *buf)
+        .expect("option tag serialization must succeed");
+    if entries.is_empty() {
+        return;
+    }
+
+    entries
+        .len()
+        .serialize_uncompressed(&mut *buf)
+        .expect("coordinate count serialization must succeed");
+    for entry in &entries {
+        entry
+            .depth
+            .serialize_uncompressed(&mut *buf)
+            .expect("depth serialization must succeed");
+        match encoding {
+            CoordinateEncoding::Natural => entry
+                .index
+                .serialize_uncompressed(&mut *buf)
+                .expect("index serialization must succeed"),
+            CoordinateEncoding::Leb128Index => {
+                encode_varint(buf, entry.index as u64);
+            }
+        }
+    }
+
+    entries
+        .len()
+        .serialize_uncompressed(&mut *buf)
+        .expect("digest count serialization must succeed");
+    for entry in entries {
+        entry
+            .digest
+            .serialize_uncompressed(&mut *buf)
+            .expect("digest serialization must succeed");
+    }
+}
+
+fn unpack_inner_entries<'a, P: Config>(
+    proof: &'a CoPath<P>,
+) -> Vec<InnerEntry<'a, P::InnerDigest>> {
+    let Some((start_depth, start_index, deltas, digests)) = proof.inner_copath.as_ref() else {
+        return Vec::new();
+    };
+    if digests.is_empty() {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::with_capacity(digests.len());
+    let mut depth = *start_depth as i64;
+    let mut index = *start_index as i64;
+    entries.push(InnerEntry {
+        depth: *start_depth,
+        index: *start_index,
+        digest: &digests[0],
+    });
+
+    let mut cursor = 0usize;
+    for digest in digests.iter().skip(1) {
+        depth += decode_delta(deltas, &mut cursor).expect("packed depth delta must decode");
+        index += decode_delta(deltas, &mut cursor).expect("packed index delta must decode");
+        entries.push(InnerEntry {
+            depth: usize::try_from(depth).expect("depth must remain non-negative"),
+            index: usize::try_from(index).expect("index must remain non-negative"),
+            digest,
+        });
+    }
+
+    assert_eq!(
+        cursor,
+        deltas.len(),
+        "all packed coordinate bytes must be consumed"
+    );
+    entries
 }
 
 fn duration_ms(duration: Duration) -> f64 {
