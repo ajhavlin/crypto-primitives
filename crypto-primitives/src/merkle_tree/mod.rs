@@ -39,7 +39,7 @@ pub mod legacy;
     target_has_atomic = "64",
     target_has_atomic = "ptr"
 ))]
-type DefaultHasher = ahash::AHasher;
+pub(super) type DefaultHasher = ahash::AHasher;
 
 #[cfg(not(all(
     target_has_atomic = "8",
@@ -48,7 +48,9 @@ type DefaultHasher = ahash::AHasher;
     target_has_atomic = "64",
     target_has_atomic = "ptr"
 )))]
-type DefaultHasher = fnv::FnvHasher;
+pub(super) type DefaultHasher = fnv::FnvHasher;
+
+pub mod implicit;
 
 type PackedInnerCopath<P> = (usize, usize, Vec<u8>, Vec<<P as Config>::InnerDigest>);
 
@@ -485,7 +487,7 @@ impl<P: Config> CoPath<P> {
     }
 
     /// Hashes provided leaves (ordered by `leaf_indexes`) and returns a map from leaf index to digest.
-    fn ingest_leaves<L, I>(
+    pub(super) fn ingest_leaves<L, I>(
         leaf_indexes: &[usize],
         leaves: &mut I,
         leaf_hash_params: &LeafParam<P>,
@@ -509,7 +511,7 @@ impl<P: Config> CoPath<P> {
     }
 
     /// Computes the minimal leaf-layer copath indices `B*_{d-1}` (siblings of on-path nodes not on-path).
-    fn expected_leaf_coset(leaf_depth: usize, on_path: &[Vec<usize>]) -> Vec<usize> {
+    pub(super) fn expected_leaf_coset(leaf_depth: usize, on_path: &[Vec<usize>]) -> Vec<usize> {
         let mut expected_leaf_coset: Vec<usize> = Vec::new();
         for &path_idx in on_path[leaf_depth].iter() {
             let sibling_idx = path_idx ^ 1;
@@ -522,7 +524,7 @@ impl<P: Config> CoPath<P> {
     }
 
     /// Confirms provided leaf copath matches the expected indices and augments `leaf_level` with them.
-    fn validate_leaf_copath(
+    pub(super) fn validate_leaf_copath(
         expected_leaf_coset: &[usize],
         provided_leaf_copath: &[P::LeafDigest],
         leaf_level: &mut BTreeMap<usize, P::LeafDigest>,
@@ -543,7 +545,7 @@ impl<P: Config> CoPath<P> {
     }
 
     /// Recomputes parents at depth `d-2` (immediately above leaves) using the leaf digests and LUT.
-    fn recompute_bottom_parents(
+    pub(super) fn recompute_bottom_parents(
         leaf_depth: usize,
         on_path: &[Vec<usize>],
         leaf_level: &BTreeMap<usize, P::LeafDigest>,
@@ -572,7 +574,7 @@ impl<P: Config> CoPath<P> {
     }
 
     /// Recomputes inner layers up to the root using cached inner digests and stores results in LUT.
-    fn recompute_inner_layers(
+    pub(super) fn recompute_inner_layers(
         leaf_depth: usize,
         on_path: &[Vec<usize>],
         two_to_one_params: &TwoToOneParam<P>,
@@ -1033,6 +1035,75 @@ impl<P: Config> MerkleTree<P> {
         })
     }
 
+    /// Returns an [`ImplicitCoPath`] for the given leaf indexes.
+    ///
+    /// This is a coordinate-free variant of [`Self::generate_multi_proof`]: both prover and
+    /// verifier independently derive the positions of required copath nodes from `leaf_indexes`
+    /// and `tree_height`, so only the digests are transmitted (in canonical depth-then-index
+    /// order). The proof is strictly smaller than a `CoPath` for any tree with more than one
+    /// inner layer, since no coordinate metadata is included.
+    pub fn generate_implicit_multi_proof(
+        &self,
+        indexes: impl IntoIterator<Item = usize>,
+    ) -> Result<implicit::ImplicitCoPath<P>, crate::Error> {
+        use ark_std::collections::BTreeSet;
+        let indexes: BTreeSet<usize> = indexes.into_iter().collect();
+        let d = self.height();
+
+        if indexes.is_empty() {
+            return Ok(implicit::ImplicitCoPath {
+                tree_height: d,
+                leaf_copath: Vec::new(),
+                inner_copath: Vec::new(),
+                leaf_indexes: Vec::new(),
+            });
+        }
+
+        let leaf_depth = d - 1;
+        let on_path = compute_on_path(leaf_depth, &indexes);
+
+        // leaf layer — identical protocol to generate_multi_proof
+        let mut leaf_coset_ids: Vec<usize> = Vec::new();
+        for &path_idx in on_path[leaf_depth].iter() {
+            let sibling_idx = path_idx ^ 1;
+            if on_path[leaf_depth].binary_search(&sibling_idx).is_err() {
+                leaf_coset_ids.push(sibling_idx);
+            }
+        }
+        leaf_coset_ids.sort_unstable();
+
+        let mut leaf_copath = Vec::with_capacity(leaf_coset_ids.len());
+        for sibling_idx in leaf_coset_ids {
+            let digest = self
+                .leaf_nodes
+                .get(sibling_idx)
+                .ok_or_else(|| crate::Error::IncorrectInputLength(self.leaf_nodes.len()))?;
+            leaf_copath.push(digest.clone());
+        }
+
+        // inner layers: canonical order = depths 1..leaf_depth, ascending index within each depth
+        let mut inner_copath: Vec<P::InnerDigest> = Vec::new();
+        for depth in 1..leaf_depth {
+            for &path_idx in on_path[depth].iter() {
+                let sibling_idx = path_idx ^ 1;
+                if on_path[depth].binary_search(&sibling_idx).is_err() {
+                    let heap_idx = level_index(depth, sibling_idx);
+                    let digest = self.non_leaf_nodes.get(heap_idx).ok_or_else(|| {
+                        crate::Error::IncorrectInputLength(self.non_leaf_nodes.len())
+                    })?;
+                    inner_copath.push(digest.clone());
+                }
+            }
+        }
+
+        Ok(implicit::ImplicitCoPath {
+            tree_height: d,
+            leaf_copath,
+            inner_copath,
+            leaf_indexes: Vec::from_iter(indexes),
+        })
+    }
+
     /// Given the index and new leaf, return the hash of leaf and an updated path in order from root to bottom non-leaf level.
     /// This does not mutate the underlying tree.
     fn updated_path<T: Borrow<P::Leaf>>(
@@ -1146,7 +1217,7 @@ fn tree_height(num_leaves: usize) -> usize {
 /// Return level-order index encoded in global heap.
 /// Node at `depth` (root=0) and position `pos` (0-based at that depth) -> heap index `(1<<depth) - 1 + pos`.
 #[inline]
-fn level_index(depth: usize, pos: usize) -> usize {
+pub(super) fn level_index(depth: usize, pos: usize) -> usize {
     ((1usize << depth) - 1) + pos
 }
 /// Returns true iff the index represents the root.
@@ -1247,7 +1318,7 @@ fn decode_varint(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
 /// Implementation detail:
 /// * Uses sorted `Vec<usize>` per level to keep the hot loops linear and cache-friendly.
 /// * Each leaf contributes one index per depth; we divide by 2 as we walk up and then sort+dedup.
-fn compute_on_path(
+pub(super) fn compute_on_path(
     depth_leaves: usize,
     indexes: &ark_std::collections::BTreeSet<usize>,
 ) -> Vec<Vec<usize>> {

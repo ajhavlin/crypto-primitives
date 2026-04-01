@@ -2,6 +2,7 @@
 
 use super::super::{decode_delta, encode_varint};
 use crate::merkle_tree::{
+    implicit::ImplicitCoPath,
     legacy, tests::test_utils::poseidon_parameters, CoPath, Config, IdentityDigestConverter,
     LeafParam, MerkleTree, TwoToOneParam,
 };
@@ -53,6 +54,8 @@ const TREE_EXPONENTS: &[u32] = &[12, 14, 16, 18, 20];
 const BATCH_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 const LEAF_WIDTH: usize = 3;
 const COORD_TREE_EXPONENTS: &[u32] = &[18];
+const IMPLICIT_COMPARE_TREE_EXPONENTS: &[u32] = &[20];
+const PRESENTATION_BATCH_SIZES: &[usize] = &[1, 8, 64, 512, 4096];
 
 #[derive(Clone, Copy)]
 enum CoordinateEncoding {
@@ -158,6 +161,16 @@ impl<P: Config> ProofStats for CoPath<P> {
             .map(|(_, _, _, digests)| digests.len())
             .unwrap_or(0);
         self.leaf_copath.len() + inner
+    }
+}
+
+impl<P: Config> ProofStats for ImplicitCoPath<P> {
+    fn opened(&self) -> usize {
+        self.leaf_indexes.len()
+    }
+
+    fn total_nodes(&self) -> usize {
+        self.leaf_copath.len() + self.inner_copath.len()
     }
 }
 
@@ -1271,5 +1284,406 @@ fn duration_ms(duration: Duration) -> f64 {
 impl TreeFixture {
     fn log2_size(&self) -> u32 {
         (self.leaves.len() as f64).log2().round() as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Implicit vs CoSet benchmark
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn implicit_vs_coset_report() {
+    run_implicit_vs_coset_report().expect("implicit vs coset report must succeed");
+}
+
+fn run_implicit_vs_coset_report() -> Result<(), Box<dyn std::error::Error>> {
+    let mut fixtures = Vec::new();
+    for &exp in IMPLICIT_COMPARE_TREE_EXPONENTS {
+        fixtures.push(build_fixture(exp)?);
+    }
+
+    let patterns = [IndexPattern::Random, IndexPattern::Clustered];
+    let mut rows = Vec::new();
+
+    for fixture in fixtures.iter() {
+        for &batch in PRESENTATION_BATCH_SIZES {
+            if batch > fixture.leaves.len() {
+                continue;
+            }
+            for &pattern in &patterns {
+                let mut scenario_rng = StdRng::seed_from_u64(
+                    0x1A1B_1C17_u64
+                        ^ ((fixture.leaves.len() as u64) << 16)
+                        ^ ((batch as u64) << 2)
+                        ^ pattern.id(),
+                );
+                let indexes =
+                    sample_indexes(pattern, batch, fixture.leaves.len(), &mut scenario_rng);
+                rows.extend(run_implicit_scenario(fixture, batch, pattern, &indexes)?);
+            }
+        }
+    }
+
+    let report_dir = PathBuf::from("target/merkle_tree_reports");
+    fs::create_dir_all(&report_dir)?;
+    let plot_files = write_implicit_vs_coset_plots(&rows, &report_dir)?;
+    write_implicit_vs_coset_report(&rows, &report_dir, &plot_files)?;
+    write_implicit_vs_coset_rows_csv(&rows, &report_dir)?;
+    Ok(())
+}
+
+fn run_implicit_scenario(
+    fixture: &TreeFixture,
+    batch: usize,
+    pattern: IndexPattern,
+    indexes: &[usize],
+) -> Result<[ReportRow; 2], Box<dyn std::error::Error>> {
+    let root = fixture.tree.root();
+    let opened_leaves: Vec<Vec<F>> = indexes.iter().map(|&i| fixture.leaves[i].clone()).collect();
+    let repeats = implicit_compare_repetitions(batch);
+
+    let coset_row = benchmark_strategy_repeated(
+        "coset",
+        || fixture.tree.generate_multi_proof(indexes.iter().copied()),
+        |proof: &CoPath<_>, leaves| {
+            proof.verify(
+                &fixture.leaf_params,
+                &fixture.two_to_one_params,
+                &root,
+                fixture.tree.height(),
+                leaves,
+            )
+        },
+        &opened_leaves,
+        fixture.leaves.len(),
+        fixture.log2_size(),
+        batch,
+        pattern,
+        repeats,
+    )?;
+
+    let implicit_row = benchmark_strategy_repeated(
+        "implicit",
+        || {
+            fixture
+                .tree
+                .generate_implicit_multi_proof(indexes.iter().copied())
+        },
+        |proof: &ImplicitCoPath<_>, leaves| {
+            proof.verify(
+                &fixture.leaf_params,
+                &fixture.two_to_one_params,
+                &root,
+                fixture.tree.height(),
+                leaves,
+            )
+        },
+        &opened_leaves,
+        fixture.leaves.len(),
+        fixture.log2_size(),
+        batch,
+        pattern,
+        repeats,
+    )?;
+
+    Ok([coset_row, implicit_row])
+}
+
+fn implicit_compare_repetitions(batch: usize) -> usize {
+    match batch {
+        0..=8 => 200,
+        9..=64 => 100,
+        65..=512 => 20,
+        _ => 3,
+    }
+}
+
+fn benchmark_strategy_repeated<Gen, Proof, Verify>(
+    strategy: &'static str,
+    mut generator: Gen,
+    mut verifier: Verify,
+    opened_leaves: &[Vec<F>],
+    tree_size: usize,
+    log2_size: u32,
+    batch: usize,
+    pattern: IndexPattern,
+    repetitions: usize,
+) -> Result<ReportRow, Box<dyn std::error::Error>>
+where
+    Proof: CanonicalSerialize + ProofStats,
+    Gen: FnMut() -> Result<Proof, crate::Error>,
+    Verify: FnMut(&Proof, Vec<Vec<F>>) -> Result<bool, crate::Error>,
+{
+    let repetitions = repetitions.max(1);
+
+    let rss_before = rss_bytes();
+    let prove_start = std::time::Instant::now();
+    let mut proof = None;
+    for _ in 0..repetitions {
+        proof = Some(generator()?);
+    }
+    let prove_elapsed = prove_start.elapsed();
+    let prove_rss = rss_delta_kb(rss_before, rss_bytes());
+    let proof = proof.expect("repeated benchmark must generate at least one proof");
+
+    let proof_bytes = serialized_size(&proof);
+    let proof_nodes = proof.total_nodes();
+    let opened = proof.opened().max(1);
+    let hashes_per_opening = proof_nodes as f64 / opened as f64;
+
+    let rss_before_verify = rss_bytes();
+    let verify_start = std::time::Instant::now();
+    for _ in 0..repetitions {
+        let verify_ok = verifier(&proof, opened_leaves.to_vec())?;
+        assert!(
+            verify_ok,
+            "verification must succeed for {} (tree_n={}, batch={}, pattern={})",
+            strategy,
+            tree_size,
+            batch,
+            pattern.label()
+        );
+    }
+    let verify_elapsed = verify_start.elapsed();
+    let verify_rss = rss_delta_kb(rss_before_verify, rss_bytes());
+
+    Ok(ReportRow {
+        tree_size,
+        log2_size,
+        batch,
+        pattern: pattern.label(),
+        strategy,
+        proof_bytes,
+        proof_nodes,
+        hashes_per_opening,
+        prove_ms: duration_ms(prove_elapsed) / repetitions as f64,
+        verify_ms: duration_ms(verify_elapsed) / repetitions as f64,
+        rss_delta_kb: combine_rss(prove_rss, verify_rss),
+    })
+}
+
+fn write_implicit_vs_coset_plots(
+    rows: &[ReportRow],
+    report_dir: &Path,
+) -> Result<BTreeMap<&'static str, Vec<String>>, Box<dyn std::error::Error>> {
+    let mut outputs: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+
+    for metric in PLOT_METRICS {
+        let mut grouped: BTreeMap<(usize, &'static str), BTreeMap<&'static str, Vec<(f64, f64)>>> =
+            BTreeMap::new();
+
+        for row in rows {
+            if let Some(value) = (metric.value)(row) {
+                grouped
+                    .entry((row.tree_size, row.pattern))
+                    .or_default()
+                    .entry(row.strategy)
+                    .or_default()
+                    .push((row.batch as f64, value));
+            }
+        }
+
+        let mut generated = Vec::new();
+        for ((tree_size, pattern), strategies) in grouped {
+            let mut ordered_series: Vec<(&'static str, Vec<(f64, f64)>)> = Vec::new();
+            for &name in &["coset", "implicit"] {
+                if let Some(mut series) = strategies.get(name).cloned() {
+                    if series.is_empty() {
+                        continue;
+                    }
+                    series.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    ordered_series.push((name, series));
+                }
+            }
+
+            if ordered_series.len() < 2 {
+                continue;
+            }
+
+            let mut min_x = f64::MAX;
+            let mut max_x = f64::MIN;
+            let mut min_y = f64::MAX;
+            let mut max_y = f64::MIN;
+            for (_, series) in &ordered_series {
+                for &(x, y) in series {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+            if min_x == f64::MAX || min_y == f64::MAX {
+                continue;
+            }
+
+            let x_pad = ((max_x - min_x) * 0.06).max(8.0);
+            let y_pad = ((max_y - min_y) * 0.10).max(256.0);
+
+            let filename = format!(
+                "implicit_vs_coset_{}_{}_{}.svg",
+                metric.filename_prefix, tree_size, pattern
+            );
+            let filepath = report_dir.join(&filename);
+            let filepath_str = filepath.to_string_lossy().to_string();
+            let drawing_area = SVGBackend::new(&filepath_str, (1280, 720)).into_drawing_area();
+            drawing_area.fill(&WHITE)?;
+
+            let mut chart = ChartBuilder::on(&drawing_area)
+                .margin(28)
+                .x_label_area_size(64)
+                .y_label_area_size(96)
+                .build_cartesian_2d(
+                    (min_x - x_pad)..(max_x + x_pad),
+                    (min_y - y_pad)..(max_y + y_pad),
+                )?;
+
+            chart
+                .configure_mesh()
+                .x_desc("input size k (opened leaves)")
+                .y_desc(metric.y_label)
+                .axis_desc_style(("Helvetica Neue", 24).into_font().style(FontStyle::Bold))
+                .label_style(("Helvetica Neue", 18).into_font())
+                .light_line_style(WHITE.mix(0.0))
+                .draw()?;
+
+            for (name, series) in &ordered_series {
+                let color = implicit_strategy_color(name);
+                chart
+                    .draw_series(LineSeries::new(series.clone(), color.stroke_width(4)))?
+                    .label(implicit_strategy_label(name))
+                    .legend({
+                        let color = color.clone();
+                        move |(x, y)| {
+                            PathElement::new(vec![(x, y), (x + 28, y)], color.stroke_width(4))
+                        }
+                    });
+
+                chart.draw_series(
+                    series
+                        .iter()
+                        .map(|point| Circle::new(*point, 5, color.filled())),
+                )?;
+            }
+
+            chart
+                .configure_series_labels()
+                .position(SeriesLabelPosition::UpperLeft)
+                .background_style(WHITE.mix(0.85))
+                .border_style(BLACK)
+                .label_font(("Helvetica Neue", 22).into_font().style(FontStyle::Bold))
+                .draw()?;
+
+            generated.push(filename);
+        }
+
+        outputs.insert(metric.name, generated);
+    }
+
+    Ok(outputs)
+}
+
+fn write_implicit_vs_coset_report(
+    rows: &[ReportRow],
+    report_dir: &Path,
+    plot_files: &BTreeMap<&'static str, Vec<String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path = report_dir.join("implicit_vs_coset_report.md");
+    let mut file = File::create(&report_path)?;
+
+    writeln!(file, "# Implicit vs CoSet Benchmark Report")?;
+    writeln!(
+        file,
+        "\nGenerated: {:?}\n",
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
+    )?;
+    writeln!(
+        file,
+        "| tree_n | log2(n) | batch_k | pattern | strategy | proof_bytes | proof_nodes | hashes/leaf | prove_ms | verify_ms |"
+    )?;
+    writeln!(
+        file,
+        "| ------ | ------- | ------- | ------- | -------- | ----------- | ----------- | ------------ | -------- | --------- |"
+    )?;
+
+    for row in rows {
+        writeln!(
+            file,
+            "| {} | {} | {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} |",
+            row.tree_size,
+            row.log2_size,
+            row.batch,
+            row.pattern,
+            row.strategy,
+            row.proof_bytes,
+            row.proof_nodes,
+            row.hashes_per_opening,
+            row.prove_ms,
+            row.verify_ms,
+        )?;
+    }
+
+    for (metric, files) in plot_files {
+        if files.is_empty() {
+            continue;
+        }
+        writeln!(file, "\n## {} Visualizations\n", metric)?;
+        for plot in files {
+            writeln!(
+                file,
+                "![{}]({})",
+                metric.replace(' ', "-").to_lowercase(),
+                plot
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_implicit_vs_coset_rows_csv(
+    rows: &[ReportRow],
+    report_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let csv_path = report_dir.join("implicit_vs_coset_rows.csv");
+    let mut file = File::create(&csv_path)?;
+    writeln!(
+        file,
+        "tree_size,log2_size,batch,pattern,strategy,proof_bytes,proof_nodes,hashes_per_opening,prove_ms,verify_ms"
+    )?;
+
+    for row in rows {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{:.6},{:.6},{:.6}",
+            row.tree_size,
+            row.log2_size,
+            row.batch,
+            row.pattern,
+            row.strategy,
+            row.proof_bytes,
+            row.proof_nodes,
+            row.hashes_per_opening,
+            row.prove_ms,
+            row.verify_ms,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn implicit_strategy_label(name: &str) -> &str {
+    match name {
+        "coset" => "CoSet (with coords)",
+        "implicit" => "Implicit (coord-free)",
+        _ => name,
+    }
+}
+
+fn implicit_strategy_color(name: &str) -> RGBColor {
+    match name {
+        "coset" => RGBColor(31, 119, 180),   // blue — same as STRATEGY_STYLE["coset"] in Python
+        "implicit" => RGBColor(123, 53, 193), // purple
+        _ => BLACK,
     }
 }

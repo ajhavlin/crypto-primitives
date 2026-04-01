@@ -1,6 +1,7 @@
 #[cfg(feature = "constraints")]
 mod constraints;
 mod delta_encoding_tests;
+mod implicit_copath_tests;
 mod test_utils;
 
 #[cfg(all(test, feature = "bench_harness"))]
