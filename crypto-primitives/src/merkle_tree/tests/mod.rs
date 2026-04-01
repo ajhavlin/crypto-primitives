@@ -1,7 +1,5 @@
 #[cfg(feature = "constraints")]
 mod constraints;
-mod delta_encoding_tests;
-mod implicit_copath_tests;
 mod test_utils;
 
 mod bytes_mt_tests {
@@ -213,6 +211,16 @@ mod field_mt_tests {
     }
 
     type FieldMT = MerkleTree<FieldMTConfig>;
+
+    fn make_tree(num_leaves: usize) -> (FieldMT, Vec<Vec<F>>) {
+        let mut rng = test_rng();
+        let params = poseidon_parameters();
+        let leaves: Vec<Vec<F>> = (0..num_leaves)
+            .map(|_| (0..3).map(|_| F::rand(&mut rng)).collect())
+            .collect();
+        let tree = FieldMT::new(&params, &params, &leaves).unwrap();
+        (tree, leaves)
+    }
 
     fn merkle_tree_test(leaves: &[Vec<F>], update_query: &[(usize, Vec<F>)]) -> () {
         let mut leaves = leaves.to_vec();
@@ -441,10 +449,8 @@ mod field_mt_tests {
 
         let proof = tree.generate_multi_proof(vec![2usize, 5, 9]).unwrap();
         let mut bad = proof.clone();
-        if let Some((_, _, _, digests)) = bad.inner_copath.as_mut() {
-            if !digests.is_empty() {
-                digests.pop(); // drop one inner sibling digest
-            }
+        if !bad.inner_copath.is_empty() {
+            bad.inner_copath.pop(); // drop one inner sibling digest
         }
         let opened: Vec<_> = bad
             .leaf_indexes
@@ -509,113 +515,204 @@ mod field_mt_tests {
             .unwrap();
         assert!(!ok, "mismatched leaf ordering must fail verification");
     }
-}
 
-mod delta_encoding_spacing_tests {
-    use super::super::{
-        decode_delta, CRHScheme, CoPath, Config, IdentityDigestConverter, TwoToOneCRHScheme,
-    };
-    use ark_std::borrow::Borrow;
+    // --- Tests ported from implicit_copath_tests ---
 
-    struct DummyCfg;
-    impl Config for DummyCfg {
-        type Leaf = ();
-        type LeafDigest = u8;
-        type LeafInnerDigestConverter = IdentityDigestConverter<u8>;
-        type InnerDigest = u8;
-        type LeafHash = DummyLeafHash;
-        type TwoToOneHash = DummyTwoToOne;
-    }
+    #[test]
+    fn multiproof_verifies_single_leaf() {
+        let (tree, leaves) = make_tree(8);
+        let params = poseidon_parameters();
+        let root = tree.root();
 
-    struct DummyLeafHash;
-    impl CRHScheme for DummyLeafHash {
-        type Input = ();
-        type Output = u8;
-        type Parameters = ();
-
-        fn setup<R: ark_std::rand::Rng>(
-            _rng: &mut R,
-        ) -> Result<Self::Parameters, super::super::Error> {
-            Ok(())
-        }
-
-        fn evaluate<T: Borrow<Self::Input>>(
-            _parameters: &Self::Parameters,
-            _input: T,
-        ) -> Result<Self::Output, super::super::Error> {
-            Ok(0)
-        }
-    }
-
-    struct DummyTwoToOne;
-    impl TwoToOneCRHScheme for DummyTwoToOne {
-        type Input = u8;
-        type Output = u8;
-        type Parameters = ();
-
-        fn setup<R: ark_std::rand::Rng>(
-            _rng: &mut R,
-        ) -> Result<Self::Parameters, super::super::Error> {
-            Ok(())
-        }
-
-        fn evaluate<T: Borrow<Self::Input>>(
-            _parameters: &Self::Parameters,
-            left: T,
-            right: T,
-        ) -> Result<Self::Output, super::super::Error> {
-            Ok(*left.borrow() ^ *right.borrow())
-        }
-
-        fn compress<T: Borrow<Self::Output>>(
-            _parameters: &Self::Parameters,
-            left: T,
-            right: T,
-        ) -> Result<Self::Output, super::super::Error> {
-            Ok(*left.borrow() ^ *right.borrow())
+        for i in 0..leaves.len() {
+            let proof = tree.generate_multi_proof([i]).unwrap();
+            let ok = proof
+                .verify(&params, &params, &root, tree.height(), [leaves[i].clone()])
+                .unwrap();
+            assert!(ok, "single-leaf proof must verify for index {i}");
         }
     }
 
     #[test]
-    fn packed_deltas_save_with_large_index_gaps() {
-        // Coordinate entries are sorted lexicographically by (depth, index), and deltas are taken
-        // between consecutive coordinates in this order (not relative to a global heap index).
-        //
-        // This test demonstrates the worst case spaced openings scenario at the leaf level, plus a
-        // higher-layer sibling at depth d-2.
-        let d: usize = 14;
-        let depth_inner = d - 2;
-        let depth_leaf = d - 1;
+    fn multiproof_verifies_full_batch() {
+        let (tree, leaves) = make_tree(16);
+        let params = poseidon_parameters();
+        let root = tree.root();
 
-        let mid = 1usize << (d - 2);
-        let end = (1usize << (d - 1)) - 1;
-
-        let entries: Vec<(usize, usize, u8)> = vec![
-            (depth_inner, 0, 10),
-            (depth_leaf, 0, 20),
-            (depth_leaf, mid, 30),
-            (depth_leaf, end, 40),
-        ];
-
-        let packed = CoPath::<DummyCfg>::pack_inner_copath(&entries).expect("packs");
-        let (_start_depth, _start_index, deltas, _digests) = packed; // returns `deltas` which is a Vec<u8>.
-
-        // The first step is from (d-2,0) -> (d-1,0): depth delta is +1, index delta is 0.
-        let mut cursor = 0usize;
-        let depth_delta = decode_delta(&deltas, &mut cursor).expect("depth delta decodes");
-        let index_delta = decode_delta(&deltas, &mut cursor).expect("index delta decodes");
-        assert_eq!(depth_delta, 1);
-        assert_eq!(index_delta, 0);
-
-        // Sanity check that the packed coordinate encoding is smaller than storing every (depth,index)
-        // as a fixed-width pair of `usize`s.
-        let naive_coord_bytes = entries.len() * 2 * core::mem::size_of::<usize>();
-        let packed_coord_bytes = 2 * core::mem::size_of::<usize>() + deltas.len();
+        let proof = tree.generate_multi_proof(0..leaves.len()).unwrap();
         assert!(
-            packed_coord_bytes < naive_coord_bytes,
-            "expected packed coordinates to be smaller (packed={}, naive={})",
-            packed_coord_bytes,
-            naive_coord_bytes
+            proof
+                .verify(&params, &params, &root, tree.height(), leaves.clone())
+                .unwrap(),
+            "full-batch proof must verify"
+        );
+        // full batch: every sibling is on-path, so no inner copath elements needed
+        assert_eq!(
+            proof.inner_copath.len(),
+            0,
+            "full-batch inner copath must be empty"
+        );
+    }
+
+    #[test]
+    fn multiproof_extra_inner_digest_fails() {
+        let (tree, leaves) = make_tree(16);
+        let params = poseidon_parameters();
+        let root = tree.root();
+
+        let proof = tree.generate_multi_proof([3usize, 9]).unwrap();
+        let mut bad = proof.clone();
+        bad.inner_copath.push(F::one()); // one spurious digest
+        let opened: Vec<_> = bad.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        let ok = bad
+            .verify(&params, &params, &root, tree.height(), opened)
+            .unwrap();
+        assert!(!ok, "extra inner digest must fail verification");
+    }
+
+    #[test]
+    fn multiproof_wrong_tree_height_fails() {
+        let (tree, leaves) = make_tree(8);
+        let params = poseidon_parameters();
+        let root = tree.root();
+
+        let proof = tree.generate_multi_proof([0usize, 3]).unwrap();
+        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        let ok = proof
+            .verify(&params, &params, &root, tree.height() + 1, opened)
+            .unwrap();
+        assert!(!ok, "mismatched tree height must fail verification");
+    }
+
+    // --- CoSet structural tests: verify that path sharing reduces copath size ---
+
+    /// I = {5, 6} on an 8-leaf tree (T3, height=4).
+    /// Leaves 5 and 6 are siblings, so their parent is on-path from both; only one inner node
+    /// (the parent's sibling at depth 1) is needed.
+    #[test]
+    fn multiproof_duplicate_commitments() {
+        let (tree, leaves) = make_tree(8);
+        let params = poseidon_parameters();
+        let root = tree.root();
+
+        let proof = tree.generate_multi_proof([5usize, 6]).unwrap();
+        assert_eq!(
+            proof.inner_copath.len(),
+            1,
+            "siblings {{5,6}} share a parent; only one inner copath node needed"
+        );
+        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        assert!(
+            proof.verify(&params, &params, &root, tree.height(), opened).unwrap(),
+            "proof must verify"
+        );
+    }
+
+    /// I = {3, 6} on an 8-leaf tree (T3, height=4).
+    /// The two paths diverge immediately but their inner nodes at depth 1 are both on-path
+    /// (each is the other's sibling — no, wait: 3>>2=0 and 6>>2=1 at depth 1, so they ARE
+    /// each other's sibling and both on-path, needing zero depth-1 copath entries).
+    /// At depth 2: 3>>1=1 and 6>>1=3; sibling of 1 is 0 (not on-path) and sibling of 3 is 2
+    /// (not on-path) — two copath entries.
+    #[test]
+    fn multiproof_derivable_commitments() {
+        let (tree, leaves) = make_tree(8);
+        let params = poseidon_parameters();
+        let root = tree.root();
+
+        let proof = tree.generate_multi_proof([3usize, 6]).unwrap();
+        assert_eq!(
+            proof.inner_copath.len(),
+            2,
+            "paths {{3,6}} share depth-1 nodes; two inner copath nodes needed at depth 2"
+        );
+        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        assert!(
+            proof.verify(&params, &params, &root, tree.height(), opened).unwrap(),
+            "proof must verify"
+        );
+    }
+
+    /// I = {1, 3, 5, 6} on an 8-leaf tree (T3, height=4).
+    /// All depth-2 and depth-1 nodes are on-path (every sibling is accounted for),
+    /// so the inner copath is empty.
+    #[test]
+    fn multiproof_duplicate_and_derivable() {
+        let (tree, leaves) = make_tree(8);
+        let params = poseidon_parameters();
+        let root = tree.root();
+
+        let proof = tree.generate_multi_proof([1usize, 3, 5, 6]).unwrap();
+        assert_eq!(
+            proof.inner_copath.len(),
+            0,
+            "I={{1,3,5,6}} covers all inner nodes; inner copath must be empty"
+        );
+        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        assert!(
+            proof.verify(&params, &params, &root, tree.height(), opened).unwrap(),
+            "proof must verify"
+        );
+    }
+
+    /// I = {1, 2, 3, 4} on a 16-leaf tree (T4, height=5).
+    /// These four leaves form a contiguous subtree; only 2 inner copath nodes are needed
+    /// (the subtree's sibling at depth 1 and one stray at depth 3).
+    #[test]
+    fn multiproof_full_subtree_batch() {
+        let (tree, leaves) = make_tree(16);
+        let params = poseidon_parameters();
+        let root = tree.root();
+
+        let proof = tree.generate_multi_proof([1usize, 2, 3, 4]).unwrap();
+        assert_eq!(
+            proof.inner_copath.len(),
+            2,
+            "contiguous subtree I={{1,2,3,4}} on T4 needs exactly 2 inner copath nodes"
+        );
+        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        assert!(
+            proof.verify(&params, &params, &root, tree.height(), opened).unwrap(),
+            "proof must verify"
+        );
+    }
+
+    /// I = {2, 7, 12, 14} on a 16-leaf tree (T4, height=5) — spread-out leaves.
+    /// Paths share few nodes; 3 inner copath nodes are needed.
+    #[test]
+    fn multiproof_spread_batch() {
+        let (tree, leaves) = make_tree(16);
+        let params = poseidon_parameters();
+        let root = tree.root();
+
+        let proof = tree.generate_multi_proof([2usize, 7, 12, 14]).unwrap();
+        assert_eq!(
+            proof.inner_copath.len(),
+            3,
+            "spread I={{2,7,12,14}} on T4 needs exactly 3 inner copath nodes"
+        );
+        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        assert!(
+            proof.verify(&params, &params, &root, tree.height(), opened).unwrap(),
+            "proof must verify"
+        );
+    }
+
+    /// Opening all leaves: every sibling is on-path, so the inner copath is empty.
+    #[test]
+    fn multiproof_all_leaves() {
+        let (tree, leaves) = make_tree(16);
+        let params = poseidon_parameters();
+        let root = tree.root();
+
+        let proof = tree.generate_multi_proof(0..leaves.len()).unwrap();
+        assert!(
+            proof.inner_copath.is_empty(),
+            "opening all leaves: inner copath must be empty"
+        );
+        assert!(
+            proof.verify(&params, &params, &root, tree.height(), leaves.clone()).unwrap(),
+            "proof must verify"
         );
     }
 }
