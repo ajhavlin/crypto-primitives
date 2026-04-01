@@ -4,9 +4,6 @@ mod delta_encoding_tests;
 mod implicit_copath_tests;
 mod test_utils;
 
-#[cfg(all(test, feature = "bench_harness"))]
-mod bench_report;
-
 mod bytes_mt_tests {
 
     use crate::{crh::*, merkle_tree::*};
@@ -332,7 +329,7 @@ mod field_mt_tests {
     }
 
     #[test]
-    fn multiproof_empty_batch_verifies() {
+    fn multiproof_empty_batch_is_caller_error() {
         let mut rng = test_rng();
         let leaves: Vec<Vec<_>> = (0..4)
             .map(|_| (0..3).map(|_| F::rand(&mut rng)).collect())
@@ -343,6 +340,7 @@ mod field_mt_tests {
         let root = tree.root();
 
         let proof = tree.generate_multi_proof(Vec::<usize>::new()).unwrap();
+        assert_eq!(proof.leaf_indexes.len(), 0);
         assert!(
             proof
                 .verify(
@@ -352,10 +350,9 @@ mod field_mt_tests {
                     tree.height(),
                     Vec::<Vec<F>>::new()
                 )
-                .unwrap(),
-            "empty batch proof should verify"
+                .is_err(),
+            "verifying an empty batch proof is a caller error"
         );
-        assert_eq!(proof.leaf_indexes.len(), 0);
     }
 
     #[test]

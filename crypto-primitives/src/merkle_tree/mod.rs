@@ -29,9 +29,6 @@ pub mod constraints;
 #[cfg(test)]
 mod tests;
 
-#[cfg(any(test, feature = "bench_harness"))]
-pub mod legacy;
-
 #[cfg(all(
     target_has_atomic = "8",
     target_has_atomic = "16",
