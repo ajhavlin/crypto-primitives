@@ -7,7 +7,7 @@ use crate::{
     Error,
 };
 use ark_serialize::{
-    CanonicalDeserialize, CanonicalSerialize, Compress, Read, SerializationError, Valid, Validate,
+    CanonicalDeserialize, CanonicalSerialize,
 };
 #[cfg(not(feature = "std"))]
 use ark_std::vec::Vec;
@@ -224,7 +224,7 @@ impl<P: Config> Path<P> {
 ///  3. Recompute all parent hashes bottom-up and compare the root against `root_hash`.
 ///
 ///  CoSet transmits only what is missing to recompute every parent on the shared union-of-paths.
-#[derive(Derivative, CanonicalSerialize)]
+#[derive(Derivative, CanonicalSerialize, CanonicalDeserialize)]
 #[derivative(
     Clone(bound = "P: Config"),
     Debug(bound = "P: Config"),
@@ -242,45 +242,6 @@ pub struct CoPath<P: Config> {
     pub leaf_indexes: Vec<usize>,
 }
 
-/// `CanonicalDeserialize` is implemented manually (rather than derived) so that the
-/// `tree_height >= 2` invariant can be enforced during deserialization, before the struct
-/// is handed to the caller.  A derived impl would not check this, leaving callers that
-/// skip the `Valid::check` step open to panics in `verify`.
-impl<P: Config> Valid for CoPath<P> {
-    fn check(&self) -> Result<(), SerializationError> {
-        if self.tree_height < 2 {
-            return Err(SerializationError::InvalidData);
-        }
-        // Propagate field checks to ensure the whole structure is valid.
-        self.leaf_copath.check()?;
-        self.inner_copath.check()?;
-        self.leaf_indexes.check()
-    }
-}
-
-impl<P: Config> CanonicalDeserialize for CoPath<P> {
-    fn deserialize_with_mode<R: Read>(
-        mut reader: R,
-        compress: Compress,
-        validate: Validate,
-    ) -> Result<Self, SerializationError> {
-        let tree_height = usize::deserialize_with_mode(&mut reader, compress, validate)?;
-        let leaf_copath =
-            Vec::<P::LeafDigest>::deserialize_with_mode(&mut reader, compress, validate)?;
-        let inner_copath =
-            Vec::<P::InnerDigest>::deserialize_with_mode(&mut reader, compress, validate)?;
-        let leaf_indexes = Vec::<usize>::deserialize_with_mode(&mut reader, compress, validate)?;
-        if tree_height < 2 {
-            return Err(SerializationError::InvalidData);
-        }
-        Ok(CoPath {
-            tree_height,
-            leaf_copath,
-            inner_copath,
-            leaf_indexes,
-        })
-    }
-}
 
 impl<P: Config> CoPath<P> {
     /// Verify that leaves are at `self.leaf_indexes` of the merkle tree.
@@ -304,23 +265,11 @@ impl<P: Config> CoPath<P> {
         expected_tree_height: usize,
         leaves: impl IntoIterator<Item = L>,
     ) -> Result<bool, crate::Error> {
-        if self.leaf_indexes.is_empty() {
-            return Err(crate::Error::GenericError(ark_std::boxed::Box::new(
-                ark_std::io::Error::new(
-                    ark_std::io::ErrorKind::InvalidInput,
-                    "batch proof must contain at least one leaf index",
-                ),
-            )));
-        }
-
-        if self.tree_height < 2 {
-            return Err(crate::Error::GenericError(ark_std::boxed::Box::new(
-                ark_std::io::Error::new(
-                    ark_std::io::ErrorKind::InvalidInput,
-                    "tree_height must be >= 2",
-                ),
-            )));
-        }
+        assert!(
+            !self.leaf_indexes.is_empty(),
+            "batch proof must contain at least one leaf index"
+        );
+        assert!(self.tree_height >= 2, "tree_height must be >= 2");
 
         if self.tree_height != expected_tree_height {
             return Ok(false);
@@ -763,7 +712,7 @@ impl<P: Config> MerkleTree<P> {
     /// ```
     ///
     /// An empty query produces a structurally valid empty proof; calling `verify` on it is a
-    /// caller error (`leaf_indexes.is_empty()` → `Err`) per the security invariant.
+    /// caller error (`leaf_indexes.is_empty()` → panic) per the security invariant.
     pub fn generate_multi_proof(
         &self,
         indexes: impl IntoIterator<Item = usize>,

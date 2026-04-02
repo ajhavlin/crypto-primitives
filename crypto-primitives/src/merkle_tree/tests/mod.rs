@@ -337,6 +337,7 @@ mod field_mt_tests {
     }
 
     #[test]
+    #[should_panic(expected = "batch proof must contain at least one leaf index")]
     fn multiproof_empty_batch_is_caller_error() {
         let mut rng = test_rng();
         let leaves: Vec<Vec<_>> = (0..4)
@@ -349,18 +350,15 @@ mod field_mt_tests {
 
         let proof = tree.generate_multi_proof(Vec::<usize>::new()).unwrap();
         assert_eq!(proof.leaf_indexes.len(), 0);
-        assert!(
-            proof
-                .verify(
-                    &leaf_crh_params,
-                    &two_to_one_params,
-                    &root,
-                    tree.height(),
-                    Vec::<Vec<F>>::new()
-                )
-                .is_err(),
-            "verifying an empty batch proof is a caller error"
-        );
+        proof
+            .verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &root,
+                tree.height(),
+                Vec::<Vec<F>>::new()
+            )
+            .unwrap();
     }
 
     #[test]
