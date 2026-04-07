@@ -59,7 +59,12 @@ impl<F: PrimeField + Absorb> TwoToOneCRHScheme for TwoToOneCRH<F> {
         left_input: T,
         right_input: T,
     ) -> Result<Self::Output, Error> {
-        Self::compress(parameters, left_input, right_input)
+        let mut sponge = PoseidonSponge::new(parameters);
+        sponge.state[0] = F::one(); // capacity tag: leaf-adjacent layer
+        sponge.absorb(left_input.borrow());
+        sponge.absorb(right_input.borrow());
+        let res = sponge.squeeze_field_elements::<F>(1);
+        Ok(res[0])
     }
 
     fn compress<T: Borrow<Self::Output>>(
