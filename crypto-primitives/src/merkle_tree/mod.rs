@@ -26,14 +26,14 @@ pub mod constraints;
 #[cfg(test)]
 mod tests;
 
-/// Convert the hash digest in different layers by converting previous layer's output to
-/// `TargetType`, which is a `Borrow` to next layer's input.
+/// Convert a hash digest from one layer to the next by transforming the previous layer's output
+/// into `TargetType`, which borrows into the next layer's input.
 pub trait DigestConverter<From, To: ?Sized> {
     type TargetType: Borrow<To>;
     fn convert(item: From) -> Result<Self::TargetType, Error>;
 }
 
-/// A trivial converter where digest of previous layer's hash is the same as next layer's input.
+/// A trivial converter where the previous layer's digest is identical to the next layer's input.
 pub struct IdentityDigestConverter<T> {
     _prev_layer_digest: T,
 }
@@ -128,7 +128,7 @@ pub type LeafParam<P> = <<P as Config>::LeafHash as CRHScheme>::Parameters;
 )]
 pub struct Path<P: Config> {
     pub leaf_sibling_hash: P::LeafDigest,
-    /// The sibling of path node ordered from higher layer to lower layer (does not include root node).
+    /// Sibling hashes from root to leaf layer (does not include the root).
     pub auth_path: Vec<P::InnerDigest>,
     /// stores the leaf index of the node
     pub leaf_index: usize,
@@ -138,7 +138,7 @@ impl<P: Config> Path<P> {
     /// The position of on_path node in `leaf_and_sibling_hash` and `non_leaf_and_sibling_hash_path`.
     /// `position[i]` is 0 (false) iff `i`th on-path node from top to bottom is on the left.
     ///
-    /// This function simply converts `self.leaf_index` to boolean array in big endian form.
+    /// Converts `self.leaf_index` to a boolean array in big-endian form.
     #[allow(unused)] // this function is actually used when r1cs feature is on
     fn position_list(&'_ self) -> impl '_ + Iterator<Item = bool> {
         (0..self.auth_path.len() + 1)
@@ -158,19 +158,19 @@ impl<P: Config> Path<P> {
         two_to_one_params: &TwoToOneParam<P>,
         root_hash: &P::InnerDigest,
         leaf: L,
-    ) -> Result<bool, crate::Error> {
+    ) -> bool {
         // calculate leaf hash
-        let claimed_leaf_hash = P::LeafHash::evaluate(&leaf_hash_params, leaf)?;
+        let claimed_leaf_hash = P::LeafHash::evaluate(&leaf_hash_params, leaf).unwrap();
         // check hash along the path from bottom to root
         let (left_child, right_child) =
-            select_left_right_child(self.leaf_index, &claimed_leaf_hash, &self.leaf_sibling_hash)?;
+            select_left_right_child(self.leaf_index, &claimed_leaf_hash, &self.leaf_sibling_hash);
 
         // leaf layer to inner layer conversion
-        let left_child = P::LeafInnerDigestConverter::convert(left_child)?;
-        let right_child = P::LeafInnerDigestConverter::convert(right_child)?;
+        let left_child = P::LeafInnerDigestConverter::convert(left_child).unwrap();
+        let right_child = P::LeafInnerDigestConverter::convert(right_child).unwrap();
 
         let mut curr_path_node =
-            P::TwoToOneHash::evaluate(&two_to_one_params, left_child, right_child)?;
+            P::TwoToOneHash::evaluate(&two_to_one_params, left_child, right_child).unwrap();
 
         // we will use `index` variable to track the position of path
         let mut index = self.leaf_index;
@@ -180,18 +180,14 @@ impl<P: Config> Path<P> {
         for level in (0..self.auth_path.len()).rev() {
             // check if path node at this level is left or right
             let (left, right) =
-                select_left_right_child(index, &curr_path_node, &self.auth_path[level])?;
+                select_left_right_child(index, &curr_path_node, &self.auth_path[level]);
             // update curr_path_node
-            curr_path_node = P::TwoToOneHash::compress(&two_to_one_params, &left, &right)?;
+            curr_path_node = P::TwoToOneHash::compress(&two_to_one_params, &left, &right).unwrap();
             index >>= 1;
         }
 
         // check if final hash is root
-        if &curr_path_node != root_hash {
-            return Ok(false);
-        }
-
-        Ok(true)
+        &curr_path_node == root_hash
     }
 }
 
@@ -209,13 +205,13 @@ impl<P: Config> Path<P> {
 /// ```
 ///  Suppose we want to prove I and J (leaf indexes 2 and 3), then:
 ///  - `tree_height`: `4`
-///  - `leaf_copath`: `[]`  (I and J are siblings — no leaf copath needed)
+///  - `leaf_copath`: `[]` (I and J are siblings, so no leaf copath is needed)
 ///  - `inner_copath`: `[D, C]`  (depths 1..3, ascending index within each depth)
 ///  - `leaf_indexes`: `[2, 3]`
 ///
 ///  Both prover and verifier independently derive the positions of all required copath nodes
-///  from `leaf_indexes` and `tree_height` by running [`compute_on_path`].  Only the digests are
-///  transmitted, in canonical depth-then-index order.  No coordinate metadata is stored.
+///  from `leaf_indexes` and `tree_height` via [`compute_on_path`]. The proof transmits only
+///  digests in canonical depth-then-index order.
 ///
 ///  At verification time:
 ///  1. Reconstruct the on-path sets A_j from `leaf_indexes` via [`compute_on_path`].
@@ -223,7 +219,7 @@ impl<P: Config> Path<P> {
 ///     `inner_copath` for each on-path node whose sibling is NOT on-path.
 ///  3. Recompute all parent hashes bottom-up and compare the root against `root_hash`.
 ///
-///  CoSet transmits only what is missing to recompute every parent on the shared union-of-paths.
+///  The proof contains only the siblings needed to reconstruct all parents on the union of paths.
 #[derive(Derivative, CanonicalSerialize, CanonicalDeserialize)]
 #[derivative(
     Clone(bound = "P: Config"),
@@ -244,130 +240,30 @@ pub struct CoPath<P: Config> {
 
 
 impl<P: Config> CoPath<P> {
-    /// Verify that leaves are at `self.leaf_indexes` of the merkle tree.
-    ///
-    /// The verifier independently reconstructs the canonical copath order from `leaf_indexes` and
-    /// `tree_height`, then consumes `inner_copath` in that order.  If the digest count does not
-    /// match what the verifier derives, verification returns `Ok(false)`.
-    ///
-    /// Leaves must be supplied in `leaf_indexes` order:
-    /// ```text
-    /// let ordered_leaves: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
-    /// ```
-    ///
-    /// `expected_tree_height` must equal the height of the tree the proof was generated from;
-    /// the verifier supplies this value — it is not taken from the (prover-controlled) proof.
-    pub fn verify<L: Borrow<P::Leaf> + Clone>(
-        &self,
-        leaf_hash_params: &LeafParam<P>,
-        two_to_one_params: &TwoToOneParam<P>,
-        root_hash: &P::InnerDigest,
-        expected_tree_height: usize,
-        leaves: impl IntoIterator<Item = L>,
-    ) -> Result<bool, crate::Error> {
-        assert!(
-            !self.leaf_indexes.is_empty(),
-            "batch proof must contain at least one leaf index"
-        );
-        assert!(self.tree_height >= 2, "tree_height must be >= 2");
-
-        if self.tree_height != expected_tree_height {
-            return Ok(false);
-        }
-
-        let d = self.tree_height;
-        let leaf_depth = d - 1;
-
-        // Hash opened leaves and build map containing all leaf digests needed at the bottom layer.
-        let mut leaves_iter = leaves.into_iter();
-        let mut leaf_level =
-            Self::ingest_leaves(&self.leaf_indexes, &mut leaves_iter, leaf_hash_params)?;
-
-        // Compute on-path sets A_j and the expected leaf coset B*_{d-1} = siblings(A_{d-1}) \ A_{d-1}.
-        let index_set: BTreeSet<usize> = self.leaf_indexes.iter().copied().collect();
-        let on_path = compute_on_path(leaf_depth, &index_set);
-
-        let expected_leaf_coset = Self::expected_leaf_coset(leaf_depth, &on_path);
-        if !Self::validate_leaf_copath(&expected_leaf_coset, &self.leaf_copath, &mut leaf_level) {
-            return Ok(false);
-        }
-
-        // Prepare inner-level maps for copath siblings and computed parents.
-        let mut inner_levels: Vec<BTreeMap<usize, P::InnerDigest>> =
-            (0..d).map(|_| BTreeMap::new()).collect();
-
-        // Consume inner_copath in canonical order: depths 1..leaf_depth, ascending index.
-        let mut copath_iter = self.inner_copath.iter();
-        for depth in 1..leaf_depth {
-            for &path_idx in on_path[depth].iter() {
-                let sibling_idx = path_idx ^ 1;
-                if on_path[depth].binary_search(&sibling_idx).is_err() {
-                    let digest = match copath_iter.next() {
-                        Some(d) => d,
-                        None => return Ok(false), // prover sent fewer digests than expected
-                    };
-                    inner_levels[depth].insert(sibling_idx, digest.clone());
-                }
-            }
-        }
-
-        // Reject if prover sent more digests than expected.
-        if copath_iter.next().is_some() {
-            return Ok(false);
-        }
-
-        if !Self::recompute_bottom_parents(
-            leaf_depth,
-            &on_path,
-            &leaf_level,
-            two_to_one_params,
-            &mut inner_levels,
-        )? {
-            return Ok(false);
-        }
-
-        if !Self::recompute_inner_layers(
-            leaf_depth,
-            &on_path,
-            two_to_one_params,
-            &mut inner_levels,
-        )? {
-            return Ok(false);
-        }
-
-        // Check root.
-        match inner_levels[0].get(&0) {
-            Some(h) => Ok(h == root_hash),
-            None => Ok(false),
-        }
-    }
-
     /// Hashes provided leaves (ordered by `leaf_indexes`) and returns a map from leaf index to digest.
     fn ingest_leaves<L, I>(
         leaf_indexes: &[usize],
         leaves: &mut I,
         leaf_hash_params: &LeafParam<P>,
-    ) -> Result<BTreeMap<usize, P::LeafDigest>, crate::Error>
+    ) -> Option<BTreeMap<usize, P::LeafDigest>>
     where
         L: Borrow<P::Leaf>,
         I: Iterator<Item = L>,
     {
         let mut leaf_level: BTreeMap<usize, P::LeafDigest> = BTreeMap::new();
         for &idx in leaf_indexes {
-            let leaf = leaves
-                .next()
-                .ok_or_else(|| crate::Error::IncorrectInputLength(leaf_indexes.len()))?;
-            let leaf_hash = P::LeafHash::evaluate(leaf_hash_params, leaf.borrow())?;
+            let leaf = leaves.next()?;
+            let leaf_hash = P::LeafHash::evaluate(leaf_hash_params, leaf.borrow()).unwrap();
             leaf_level.insert(idx, leaf_hash);
         }
         if leaves.next().is_some() {
-            return Err(crate::Error::IncorrectInputLength(leaf_indexes.len()));
+            return None;
         }
-        Ok(leaf_level)
+        Some(leaf_level)
     }
 
-    /// Computes the minimal leaf-layer copath indices `B*_{d-1}` (siblings of on-path nodes not on-path).
-    fn expected_leaf_coset(leaf_depth: usize, on_path: &[Vec<usize>]) -> Vec<usize> {
+    /// Compute which leaf siblings are needed to verify the proof (those not already on-path).
+    fn compute_needed_leaf_siblings(leaf_depth: usize, on_path: &[Vec<usize>]) -> Vec<usize> {
         let mut expected_leaf_coset: Vec<usize> = Vec::new();
         for &path_idx in on_path[leaf_depth].iter() {
             let sibling_idx = path_idx ^ 1;
@@ -379,8 +275,8 @@ impl<P: Config> CoPath<P> {
         expected_leaf_coset
     }
 
-    /// Confirms provided leaf copath matches the expected indices and augments `leaf_level` with them.
-    fn validate_leaf_copath(
+    /// Absorb the leaf copath digests into `leaf_level`, verifying counts and detecting conflicts.
+    fn absorb_leaf_copath(
         expected_leaf_coset: &[usize],
         provided_leaf_copath: &[P::LeafDigest],
         leaf_level: &mut BTreeMap<usize, P::LeafDigest>,
@@ -400,38 +296,39 @@ impl<P: Config> CoPath<P> {
         true
     }
 
-    /// Recomputes parents at depth `leaf_depth - 1` using the leaf digests.
-    fn recompute_bottom_parents(
+    /// Verify and hash the transition from leaf digests to the first inner layer.
+    fn verify_and_hash_bottom_layer(
         leaf_depth: usize,
         on_path: &[Vec<usize>],
         leaf_level: &BTreeMap<usize, P::LeafDigest>,
         two_to_one_params: &TwoToOneParam<P>,
         inner_levels: &mut [BTreeMap<usize, P::InnerDigest>],
-    ) -> Result<bool, crate::Error> {
+    ) -> bool {
         for &parent_index in on_path[leaf_depth - 1].iter() {
             let left = leaf_level.get(&(parent_index * 2)).cloned();
             let right = leaf_level.get(&(parent_index * 2 + 1)).cloned();
             let (left, right) = match (left, right) {
                 (Some(left), Some(right)) => (left, right),
-                _ => return Ok(false),
+                _ => return false,
             };
             let parent = P::TwoToOneHash::evaluate(
                 two_to_one_params,
-                P::LeafInnerDigestConverter::convert(left)?,
-                P::LeafInnerDigestConverter::convert(right)?,
-            )?;
+                P::LeafInnerDigestConverter::convert(left).unwrap(),
+                P::LeafInnerDigestConverter::convert(right).unwrap(),
+            )
+            .unwrap();
             inner_levels[leaf_depth - 1].insert(parent_index, parent);
         }
-        Ok(true)
+        true
     }
 
-    /// Recomputes inner layers up to the root using cached inner digests.
-    fn recompute_inner_layers(
+    /// Verify and hash the inner layers from leaf depth up to the root.
+    fn verify_and_hash_inner_chain(
         leaf_depth: usize,
         on_path: &[Vec<usize>],
         two_to_one_params: &TwoToOneParam<P>,
         inner_levels: &mut [BTreeMap<usize, P::InnerDigest>],
-    ) -> Result<bool, crate::Error> {
+    ) -> bool {
         for depth in (1..=leaf_depth - 1).rev() {
             let parent_depth = depth - 1;
             for &parent_index in on_path[parent_depth].iter() {
@@ -439,19 +336,120 @@ impl<P: Config> CoPath<P> {
                 let right = inner_levels[depth].get(&(parent_index * 2 + 1)).cloned();
                 let (left, right) = match (left, right) {
                     (Some(left), Some(right)) => (left, right),
-                    _ => return Ok(false),
+                    _ => return false,
                 };
-                let parent = P::TwoToOneHash::compress(two_to_one_params, &left, &right)?;
+                let parent =
+                    P::TwoToOneHash::compress(two_to_one_params, &left, &right).unwrap();
                 inner_levels[parent_depth].insert(parent_index, parent);
             }
         }
-        Ok(true)
+        true
+    }
+
+    /// Verify that leaves are at `self.leaf_indexes` of the merkle tree.
+    ///
+    /// The verifier reconstructs the canonical copath order from `leaf_indexes` and `tree_height`,
+    /// then consumes digests from `inner_copath`. If the count doesn't match, verification fails.
+    ///
+    /// Leaves must be supplied in `leaf_indexes` order:
+    /// ```text
+    /// let ordered_leaves: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+    /// ```
+    ///
+    /// `expected_tree_height` must equal the height of the tree the proof was generated from.
+    /// The verifier supplies this value rather than taking it from the (prover-controlled) proof.
+    pub fn verify<L: Borrow<P::Leaf> + Clone>(
+        &self,
+        leaf_hash_params: &LeafParam<P>,
+        two_to_one_params: &TwoToOneParam<P>,
+        root_hash: &P::InnerDigest,
+        expected_tree_height: usize,
+        leaves: impl IntoIterator<Item = L>,
+    ) -> bool {
+        assert!(
+            !self.leaf_indexes.is_empty(),
+            "batch proof must contain at least one leaf index"
+        );
+        assert!(self.tree_height >= 2, "tree_height must be >= 2");
+
+        if self.tree_height != expected_tree_height {
+            return false;
+        }
+
+        let d = self.tree_height;
+        let leaf_depth = d - 1;
+
+        // Hash opened leaves and build map containing all leaf digests needed at the bottom layer.
+        let mut leaves_iter = leaves.into_iter();
+        let mut leaf_level =
+            match Self::ingest_leaves(&self.leaf_indexes, &mut leaves_iter, leaf_hash_params) {
+                Some(m) => m,
+                None => return false,
+            };
+
+        // Compute on-path sets A_j and the expected leaf coset B*_{d-1} = siblings(A_{d-1}) \ A_{d-1}.
+        let index_set: BTreeSet<usize> = self.leaf_indexes.iter().copied().collect();
+        let on_path = compute_on_path(leaf_depth, &index_set);
+
+        let expected_leaf_coset = Self::expected_leaf_coset(leaf_depth, &on_path);
+        if !Self::validate_leaf_copath(&expected_leaf_coset, &self.leaf_copath, &mut leaf_level) {
+            return false;
+        }
+
+        // Prepare inner-level maps for copath siblings and computed parents.
+        let mut inner_levels: Vec<BTreeMap<usize, P::InnerDigest>> =
+            (0..d).map(|_| BTreeMap::new()).collect();
+
+        // Consume inner_copath in canonical order: depths 1..leaf_depth, ascending index.
+        let mut copath_iter = self.inner_copath.iter();
+        for depth in 1..leaf_depth {
+            for &path_idx in on_path[depth].iter() {
+                let sibling_idx = path_idx ^ 1;
+                if on_path[depth].binary_search(&sibling_idx).is_err() {
+                    let digest = match copath_iter.next() {
+                        Some(d) => d,
+                        None => return false, // prover sent fewer digests than expected
+                    };
+                    inner_levels[depth].insert(sibling_idx, digest.clone());
+                }
+            }
+        }
+
+        // Reject if prover sent more digests than expected.
+        if copath_iter.next().is_some() {
+            return false;
+        }
+
+        if !Self::recompute_bottom_parents(
+            leaf_depth,
+            &on_path,
+            &leaf_level,
+            two_to_one_params,
+            &mut inner_levels,
+        ) {
+            return false;
+        }
+
+        if !Self::recompute_inner_layers(
+            leaf_depth,
+            &on_path,
+            two_to_one_params,
+            &mut inner_levels,
+        ) {
+            return false;
+        }
+
+        // Check root.
+        match inner_levels[0].get(&0) {
+            Some(h) => h == root_hash,
+            None => false,
+        }
     }
 
     // The position of on_path node in `leaf_and_sibling_hash` and `non_leaf_and_sibling_hash_path`.
     // `position[i]` is 0 (false) iff `i`th on-path node from top to bottom is on the left.
     //
-    // This function simply converts every index in `self.leaf_indexes` to boolean array in big endian form.
+    // Converts each index in `self.leaf_indexes` to a boolean array in big-endian form.
     #[allow(unused)] // this function is actually used when r1cs feature is on
     fn position_list(&'_ self) -> impl '_ + Iterator<Item = Vec<bool>> {
         let path_len = self.tree_height.saturating_sub(2);
@@ -479,28 +477,26 @@ fn select_left_right_child<L: Clone>(
     index: usize,
     computed_hash: &L,
     sibling_hash: &L,
-) -> Result<(L, L), crate::Error> {
+) -> (L, L) {
     let is_left = index & 1 == 0;
     let mut left_child = computed_hash;
     let mut right_child = sibling_hash;
     if !is_left {
         core::mem::swap(&mut left_child, &mut right_child);
     }
-    Ok((left_child.clone(), right_child.clone()))
+    (left_child.clone(), right_child.clone())
 }
 
-/// Defines a merkle tree data structure.
-/// This merkle tree has runtime fixed height, and assumes number of leaves is 2^height.
+/// A merkle tree with fixed height and a leaf count of 2^height.
 ///
 /// TODO: add RFC-6962 compatible merkle tree in the future.
-/// For this release, padding will not be supported because of security concerns: if the leaf hash and two to one hash uses same underlying
-/// CRH, a malicious prover can prove a leaf while the actual node is an inner node. In the future, we can prefix leaf hashes in different layers to
-/// solve the problem.
+/// For this release, padding is not supported due to security: if leaf and inner hashes use
+/// the same CRH, a malicious prover could prove a leaf that is actually an inner node. Future
+/// versions can prefix hashes by layer to prevent this.
 #[derive(Derivative)]
 #[derivative(Clone(bound = "P: Config"))]
 pub struct MerkleTree<P: Config> {
-    /// stores the non-leaf nodes in level order. The first element is the root node.
-    /// The ith nodes (starting at 1st) children are at indices `2*i`, `2*i+1`
+    /// Non-leaf nodes in level order, with the root at index 0. For node i, children are at `2*i + 1` and `2*i + 2`.
     non_leaf_nodes: Vec<P::InnerDigest>,
     /// store the hash of leaf nodes from left to right
     leaf_nodes: Vec<P::LeafDigest>,
@@ -513,8 +509,7 @@ pub struct MerkleTree<P: Config> {
 }
 
 impl<P: Config> MerkleTree<P> {
-    /// Create an empty merkle tree such that all leaves are zero-filled.
-    /// Consider using a sparse merkle tree if you need the tree to be low memory
+    /// Create a merkle tree with zero-filled leaves. Use a sparse tree for memory efficiency.
     pub fn blank(
         leaf_hash_param: &LeafParam<P>,
         two_to_one_hash_param: &TwoToOneParam<P>,
@@ -525,7 +520,7 @@ impl<P: Config> MerkleTree<P> {
         Self::new_with_leaf_digest(leaf_hash_param, two_to_one_hash_param, leaf_digests)
     }
 
-    /// Returns a new merkle tree. `leaves.len()` should be power of two.
+    /// Create a merkle tree from leaves. The leaf count must be a power of two.
     pub fn new<L: AsRef<P::Leaf> + Send>(
         leaf_hash_param: &LeafParam<P>,
         two_to_one_hash_param: &TwoToOneParam<P>,
@@ -696,13 +691,13 @@ impl<P: Config> MerkleTree<P> {
         })
     }
 
-    /// Returns a [`CoPath`] (coordinate-free batch membership proof) for the given leaf indexes,
+    /// Returns a [`CoPath`] (batch membership proof) for the given leaf indexes,
     /// sufficient to verify each leaf up to the root.
     /// Indexes are internally deduplicated and sorted; the proof emits digests in that order.
     ///
     /// With the CoSet encoding we do not store full per-leaf authentication paths.
     /// Instead, for each tree level, only the siblings of on-path nodes that are not themselves
-    /// on-path are transmitted — in canonical depth-then-index order.  The verifier reconstructs
+    /// on-path are transmitted in canonical depth-then-index order.  The verifier reconstructs
     /// the ordering independently from `leaf_indexes` and `tree_height`, so no coordinate
     /// metadata is included.
     ///
@@ -776,8 +771,7 @@ impl<P: Config> MerkleTree<P> {
         })
     }
 
-    /// Given the index and new leaf, return the hash of leaf and an updated path in order from root to bottom non-leaf level.
-    /// This does not mutate the underlying tree.
+    /// Compute the hash of a new leaf and the updated path from root to leaf, without modifying the tree.
     fn updated_path<T: Borrow<P::Leaf>>(
         &self,
         index: usize,
@@ -830,7 +824,7 @@ impl<P: Config> MerkleTree<P> {
         Ok((new_leaf_hash, path_top_to_bottom))
     }
 
-    /// Update the leaf at `index` to updated leaf.
+    /// Update the leaf at `index`.
     /// ```tree_diagram
     ///         [A]
     ///        /   \
@@ -853,9 +847,7 @@ impl<P: Config> MerkleTree<P> {
         Ok(())
     }
 
-    /// Update the leaf and check if the updated root is equal to `asserted_new_root`.
-    ///
-    /// Tree will not be modified if the check fails.
+    /// Update the leaf and verify the root matches `asserted_new_root`. Does not modify the tree if verification fails.
     pub fn check_update<T: Borrow<P::Leaf>>(
         &mut self,
         index: usize,
@@ -887,8 +879,7 @@ fn tree_height(num_leaves: usize) -> usize {
     (ark_std::log2(num_leaves) as usize) + 1
 }
 
-/// Return level-order index encoded in global heap.
-/// Node at `depth` (root=0) and position `pos` (0-based at that depth) -> heap index `(1<<depth) - 1 + pos`.
+/// Convert depth and position to a heap index. Node at depth d and position p maps to index (1<<d) - 1 + p.
 #[inline]
 pub(super) fn level_index(depth: usize, pos: usize) -> usize {
     ((1usize << depth) - 1) + pos
@@ -945,12 +936,12 @@ fn convert_index_to_last_level(index: usize, tree_height: usize) -> usize {
     index + (1 << (tree_height - 1)) - 1
 }
 
-/// Build the on-path sets A_j from the (sorted, unique) leaf index set I and the leaf depth `d-1`.
-/// A_j contains 0-based indices at depth j that lie on the union of all single paths from I to the root.
+/// Compute the on-path sets A_j for a batch of leaf indexes.
+/// A_j contains all indices at depth j that lie on at least one path from the leaves to the root.
 ///
 /// Implementation detail:
 /// * Uses sorted `Vec<usize>` per level to keep the hot loops linear and cache-friendly.
-/// * Each leaf contributes one index per depth; we divide by 2 as we walk up and then sort+dedup.
+/// * Each leaf contributes one index per depth. As we walk up, we divide by 2 then sort and dedup.
 pub(super) fn compute_on_path(
     depth_leaves: usize,
     indexes: &ark_std::collections::BTreeSet<usize>,
