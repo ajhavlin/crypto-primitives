@@ -391,8 +391,8 @@ impl<P: Config> CoPath<P> {
         let index_set: BTreeSet<usize> = self.leaf_indexes.iter().copied().collect();
         let on_path = compute_on_path(leaf_depth, &index_set);
 
-        let expected_leaf_coset = Self::expected_leaf_coset(leaf_depth, &on_path);
-        if !Self::validate_leaf_copath(&expected_leaf_coset, &self.leaf_copath, &mut leaf_level) {
+        let expected_leaf_coset = Self::compute_needed_leaf_siblings(leaf_depth, &on_path);
+        if !Self::absorb_leaf_copath(&expected_leaf_coset, &self.leaf_copath, &mut leaf_level) {
             return false;
         }
 
@@ -420,7 +420,7 @@ impl<P: Config> CoPath<P> {
             return false;
         }
 
-        if !Self::recompute_bottom_parents(
+        if !Self::verify_and_hash_bottom_layer(
             leaf_depth,
             &on_path,
             &leaf_level,
@@ -430,7 +430,7 @@ impl<P: Config> CoPath<P> {
             return false;
         }
 
-        if !Self::recompute_inner_layers(
+        if !Self::verify_and_hash_inner_chain(
             leaf_depth,
             &on_path,
             two_to_one_params,
