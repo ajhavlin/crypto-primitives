@@ -6,7 +6,9 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::vec::Vec;
 use ark_std::{borrow::Borrow, fmt::Debug, hash::Hash, rand::Rng};
 
+pub mod blake3;
 pub mod bowe_hopwood;
+pub mod byte_digest;
 #[cfg(feature = "constraints")]
 pub mod constraints;
 pub mod injective_map;

@@ -26,6 +26,7 @@ ark-r1cs-std = { git = "https://github.com/arkworks-rs/r1cs-std", default-featur
 ark-snark = { git = "https://github.com/arkworks-rs/snark.git", default-features = false }
 
 blake2 = { version = "0.10", default-features = false }
+blake3 = { version = "1", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 digest = { version = "0.10", default-features = false }
 merlin = { version = "3.0.0", default-features = false, optional = true }
@@ -39,7 +40,7 @@ hashbrown = { version = "0.15", default-features = false, features = [ "inline-m
 
 [features]
 default = ["std"]
-std = ["ark-ff/std", "ark-ec/std", "ark-std/std", "ark-relations/std", "ark-r1cs-std?/std" ]
+std = ["ark-ff/std", "ark-ec/std", "ark-std/std", "ark-relations/std", "ark-r1cs-std?/std", "blake3/std" ]
 print-trace = ["ark-std/print-trace"]
 parallel = [
     "std",
