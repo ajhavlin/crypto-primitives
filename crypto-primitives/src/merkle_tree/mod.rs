@@ -2,10 +2,11 @@
 
 /// Defines a trait to chain two types of CRHs.
 use crate::{
-    crh::{CRHScheme, TwoToOneCRHScheme},
+    crh::{CRHScheme, FieldTwoToOneCRHScheme, TwoToOneCRHScheme},
     sponge::Absorb,
     Error,
 };
+use ark_ff::Field;
 use ark_serialize::{
     CanonicalDeserialize, CanonicalSerialize,
 };
@@ -107,6 +108,18 @@ pub trait Config {
 pub type TwoToOneParam<P> = <<P as Config>::TwoToOneHash as TwoToOneCRHScheme>::Parameters;
 pub type LeafParam<P> = <<P as Config>::LeafHash as CRHScheme>::Parameters;
 
+/// A [`Config`] whose leaf, inner, and two-to-one hashes all operate natively on a single
+/// field `F`. Implementations must fix `LeafDigest = InnerDigest = F` and use
+/// [`IdentityDigestConverter<F>`], so no digest-to-bytes conversion is needed between layers.
+/// The associated two-to-one hash is required to implement [`FieldTwoToOneCRHScheme<F>`],
+/// enabling field-native optimizations in future verify/update paths.
+pub trait FieldMerkleTreeConfig<F: Field + Absorb>:
+    Config<LeafDigest = F, InnerDigest = F, LeafInnerDigestConverter = IdentityDigestConverter<F>>
+where
+    Self::TwoToOneHash: FieldTwoToOneCRHScheme<F>,
+{
+}
+
 /// Stores the hashes of a particular path (in order) from root to leaf.
 /// For example:
 /// ```tree_diagram
@@ -166,6 +179,7 @@ impl<P: Config> Path<P> {
             select_left_right_child(self.leaf_index, &claimed_leaf_hash, &self.leaf_sibling_hash);
 
         // leaf layer to inner layer conversion
+        // TODO: Phase 2 — remove converter call for FieldMerkleTreeConfig via specialized path.
         let left_child = P::LeafInnerDigestConverter::convert(left_child).unwrap();
         let right_child = P::LeafInnerDigestConverter::convert(right_child).unwrap();
 
@@ -311,6 +325,7 @@ impl<P: Config> CoPath<P> {
                 (Some(left), Some(right)) => (left, right),
                 _ => return false,
             };
+            // TODO: Phase 2 — remove converter call for FieldMerkleTreeConfig via specialized path.
             let parent = P::TwoToOneHash::evaluate(
                 two_to_one_params,
                 P::LeafInnerDigestConverter::convert(left).unwrap(),
@@ -582,6 +597,7 @@ impl<P: Config> MerkleTree<P> {
                     let left_leaf_index = left_child(current_index) - upper_bound;
                     let right_leaf_index = right_child(current_index) - upper_bound;
 
+                    // TODO: Phase 2 — remove converter calls for FieldMerkleTreeConfig via specialized path.
                     *n = P::TwoToOneHash::evaluate(
                         two_to_one_hash_param,
                         P::LeafInnerDigestConverter::convert(
@@ -791,6 +807,7 @@ impl<P: Config> MerkleTree<P> {
         // calculate the updated hash at bottom non-leaf-level
         let mut path_bottom_to_top = Vec::with_capacity(self.height - 1);
         {
+            // TODO: Phase 2 — remove converter calls for FieldMerkleTreeConfig via specialized path.
             path_bottom_to_top.push(P::TwoToOneHash::evaluate(
                 &self.two_to_one_hash_param,
                 P::LeafInnerDigestConverter::convert(leaf_left.clone())?,
@@ -968,4 +985,26 @@ pub(super) fn compute_on_path(
         level_vec.dedup();
     }
     path_sets
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+mod field_tree_helpers {
+    use super::*;
+
+    /// Placeholder for the Phase 2 field-native single-path verifier.
+    /// Activated once `verify_and_hash_bottom_layer` and `Path::verify` gain field-specialized
+    /// paths that skip [`LeafInnerDigestConverter`] entirely.
+    pub(crate) fn verify_field_tree<F, P>(
+        _leaf_digest: F,
+        _path: &Path<P>,
+        _parameters: &TwoToOneParam<P>,
+    ) -> Result<bool, Error>
+    where
+        F: Field + Absorb,
+        P: FieldMerkleTreeConfig<F>,
+        P::TwoToOneHash: FieldTwoToOneCRHScheme<F>,
+    {
+        todo!("activated in Phase 2")
+    }
 }

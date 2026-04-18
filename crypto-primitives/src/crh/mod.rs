@@ -1,6 +1,9 @@
 #![allow(clippy::upper_case_acronyms)]
 use crate::Error;
+use ark_ff::Field;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+#[cfg(not(feature = "std"))]
+use ark_std::vec::Vec;
 use ark_std::{borrow::Borrow, fmt::Debug, hash::Hash, rand::Rng};
 
 pub mod bowe_hopwood;
@@ -49,4 +52,42 @@ pub trait TwoToOneCRHScheme {
         left_input: T,
         right_input: T,
     ) -> Result<Self::Output, Error>;
+}
+
+/// Two-to-one CRH whose inputs and outputs are byte slices.
+pub trait ByteTwoToOneCRHScheme {
+    type Parameters: Clone + CanonicalSerialize + CanonicalDeserialize + Sync;
+
+    fn setup<R: Rng>(r: &mut R) -> Result<Self::Parameters, Error>;
+
+    fn evaluate(
+        parameters: &Self::Parameters,
+        left_input: &[u8],
+        right_input: &[u8],
+    ) -> Result<Vec<u8>, Error>;
+
+    fn compress(
+        parameters: &Self::Parameters,
+        left_input: &[u8],
+        right_input: &[u8],
+    ) -> Result<Vec<u8>, Error>;
+}
+
+/// Two-to-one CRH whose inputs and outputs are elements of the same field.
+pub trait FieldTwoToOneCRHScheme<F: Field> {
+    type Parameters: Clone + CanonicalSerialize + CanonicalDeserialize + Sync;
+
+    fn setup<R: Rng>(r: &mut R) -> Result<Self::Parameters, Error>;
+
+    fn evaluate(
+        parameters: &Self::Parameters,
+        left_input: F,
+        right_input: F,
+    ) -> Result<F, Error>;
+
+    fn compress(
+        parameters: &Self::Parameters,
+        left_input: F,
+        right_input: F,
+    ) -> Result<F, Error>;
 }
