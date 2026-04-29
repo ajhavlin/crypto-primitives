@@ -1,5 +1,3 @@
-#[cfg(feature = "constraints")]
-mod constraints;
 mod test_utils;
 
 mod bytes_mt_tests {
@@ -52,24 +50,24 @@ mod bytes_mt_tests {
         let mut root = tree.root();
         // test merkle tree functionality without update
         for (i, leaf) in leaves.iter().enumerate() {
-            let proof = tree.generate_proof(i).unwrap();
-            assert!(proof
-                .verify(&leaf_crh_params, &two_to_one_params, &root, leaf.as_slice()));
-        }
-
-        // test the merkle tree multi-proof functionality
-        let mut multi_proof = tree
-            .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
-            .unwrap();
-
-        assert!(multi_proof
-            .verify(
+            let proof = tree.generate_multi_proof([i]);
+            assert!(proof.verify(
                 &leaf_crh_params,
                 &two_to_one_params,
                 &root,
                 tree.height(),
-                leaves.clone()
+                [leaf.as_slice()]
             ));
+        }
+
+        // test the merkle tree multi-proof functionality
+        let scheme =
+            JubJubMerkleTree::blank(&leaf_crh_params, &two_to_one_params, tree.height()).unwrap();
+        let committed = scheme.commit(&leaves).unwrap();
+        let indices: Vec<_> = (0..leaves.len()).collect();
+        let opening = Opening::new(indices.clone(), leaves.clone());
+        let proof = committed.open(indices);
+        assert!(scheme.check(&root, &opening, &proof));
 
         // test merkle tree update functionality
         for (i, v) in update_query {
@@ -81,24 +79,22 @@ mod bytes_mt_tests {
         root = tree.root();
         // verify again
         for (i, leaf) in leaves.iter().enumerate() {
-            let proof = tree.generate_proof(i).unwrap();
-            assert!(proof
-                .verify(&leaf_crh_params, &two_to_one_params, &root, leaf.as_slice()));
-        }
-
-        // test the merkle tree multi-proof functionality again
-        multi_proof = tree
-            .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
-            .unwrap();
-
-        assert!(multi_proof
-            .verify(
+            let proof = tree.generate_multi_proof([i]);
+            assert!(proof.verify(
                 &leaf_crh_params,
                 &two_to_one_params,
                 &root,
                 tree.height(),
-                leaves.clone()
+                [leaf.as_slice()]
             ));
+        }
+
+        // test the merkle tree multi-proof functionality again
+        let committed = scheme.commit(&leaves).unwrap();
+        let indices: Vec<_> = (0..leaves.len()).collect();
+        let opening = Opening::new(indices.clone(), leaves.clone());
+        let proof = committed.open(indices);
+        assert!(scheme.check(&root, &opening, &proof));
     }
 
     #[test]
@@ -160,25 +156,27 @@ mod bytes_mt_tests {
         let tree = JubJubMerkleTree::new(&leaf_crh_params, &two_to_one_params, &serialized_leaves)
             .unwrap();
 
-        let mut proofs = Vec::with_capacity(leaves.len());
-
         for (i, _) in leaves.iter().enumerate() {
-            proofs.push(tree.generate_proof(i).unwrap());
-        }
-
-        let multi_proof = tree
-            .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
-            .unwrap();
-
-        // multi-proof should verify and contain co-set data consistent with expected on-path sets
-        assert!(multi_proof
-            .verify(
+            let proof = tree.generate_multi_proof([i]);
+            assert!(proof.verify(
                 &leaf_crh_params,
                 &two_to_one_params,
                 &tree.root(),
                 tree.height(),
-                serialized_leaves.clone()
+                [serialized_leaves[i].as_slice()]
             ));
+        }
+
+        let multi_proof = tree.generate_multi_proof((0..leaves.len()).collect::<Vec<_>>());
+
+        // multi-proof should verify and contain co-set data consistent with expected on-path sets
+        assert!(multi_proof.verify(
+            &leaf_crh_params,
+            &two_to_one_params,
+            &tree.root(),
+            tree.height(),
+            serialized_leaves.clone()
+        ));
     }
 }
 
@@ -187,6 +185,7 @@ mod field_mt_tests {
         crh::poseidon,
         merkle_tree::{
             tests::test_utils::poseidon_parameters, Config, IdentityDigestConverter, MerkleTree,
+            Opening,
         },
     };
     use ark_std::{test_rng, One, UniformRand};
@@ -228,50 +227,40 @@ mod field_mt_tests {
 
         // test merkle tree functionality without update
         for (i, leaf) in leaves.iter().enumerate() {
-            let proof = tree.generate_proof(i).unwrap();
-            assert!(proof
-                .verify(&leaf_crh_params, &two_to_one_params, &root, leaf.as_slice()));
-        }
-
-        // test the merkle tree multi-proof functionality
-        let mut multi_proof = tree
-            .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
-            .unwrap();
-
-        assert!(multi_proof
-            .verify(
+            let proof = tree.generate_multi_proof([i]);
+            assert!(proof.verify(
                 &leaf_crh_params,
                 &two_to_one_params,
                 &root,
                 tree.height(),
-                leaves.clone()
+                [leaf.as_slice()]
             ));
+        }
+
+        // test the merkle tree multi-proof functionality
+        let scheme = FieldMT::blank(&leaf_crh_params, &two_to_one_params, tree.height()).unwrap();
+        let committed = scheme.commit(&leaves).unwrap();
+        let indices: Vec<_> = (0..leaves.len()).collect();
+        let opening = Opening::new(indices.clone(), leaves.clone());
+        let proof = committed.open(indices);
+        assert!(scheme.check(&root, &opening, &proof));
 
         {
             // wrong root should lead to error but do not panic
             let wrong_root = root + F::one();
-            let proof = tree.generate_proof(0).unwrap();
-            assert!(!proof
-                .verify(
-                    &leaf_crh_params,
-                    &two_to_one_params,
-                    &wrong_root,
-                    leaves[0].as_slice()
-                ));
+            let proof = tree.generate_multi_proof([0usize]);
+            assert!(!proof.verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &wrong_root,
+                tree.height(),
+                [leaves[0].as_slice()]
+            ));
 
-            // test the merkle tree multi-proof functionality
-            let multi_proof = tree
-                .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
-                .unwrap();
-
-            assert!(!multi_proof
-                .verify(
-                    &leaf_crh_params,
-                    &two_to_one_params,
-                    &wrong_root,
-                    tree.height(),
-                    leaves.clone()
-                ));
+            let indices: Vec<_> = (0..leaves.len()).collect();
+            let opening = Opening::new(indices.clone(), leaves.clone());
+            let proof = committed.open(indices);
+            assert!(!scheme.check(&wrong_root, &opening, &proof));
         }
 
         // test merkle tree update functionality
@@ -285,23 +274,21 @@ mod field_mt_tests {
 
         // verify again
         for (i, leaf) in leaves.iter().enumerate() {
-            let proof = tree.generate_proof(i).unwrap();
-            assert!(proof
-                .verify(&leaf_crh_params, &two_to_one_params, &root, leaf.as_slice()));
-        }
-
-        multi_proof = tree
-            .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
-            .unwrap();
-
-        assert!(multi_proof
-            .verify(
+            let proof = tree.generate_multi_proof([i]);
+            assert!(proof.verify(
                 &leaf_crh_params,
                 &two_to_one_params,
                 &root,
                 tree.height(),
-                leaves.clone()
+                [leaf.as_slice()]
             ));
+        }
+
+        let committed = scheme.commit(&leaves).unwrap();
+        let indices: Vec<_> = (0..leaves.len()).collect();
+        let opening = Opening::new(indices.clone(), leaves.clone());
+        let proof = committed.open(indices);
+        assert!(scheme.check(&root, &opening, &proof));
     }
 
     #[test]
@@ -326,8 +313,7 @@ mod field_mt_tests {
     }
 
     #[test]
-    #[should_panic(expected = "batch proof must contain at least one leaf index")]
-    fn multiproof_empty_batch_is_caller_error() {
+    fn multiproof_empty_batch_returns_false() {
         let mut rng = test_rng();
         let leaves: Vec<Vec<_>> = (0..4)
             .map(|_| (0..3).map(|_| F::rand(&mut rng)).collect())
@@ -337,16 +323,16 @@ mod field_mt_tests {
         let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof(Vec::<usize>::new()).unwrap();
+        let proof = tree.generate_multi_proof(Vec::<usize>::new());
         assert_eq!(proof.leaf_indexes.len(), 0);
-        proof
-            .verify(
-                &leaf_crh_params,
-                &two_to_one_params,
-                &root,
-                tree.height(),
-                Vec::<Vec<F>>::new()
-            );
+        let ok = proof.verify(
+            &leaf_crh_params,
+            &two_to_one_params,
+            &root,
+            tree.height(),
+            Vec::<Vec<F>>::new(),
+        );
+        assert!(!ok, "empty batch must fail verification rather than panic");
     }
 
     #[test]
@@ -361,7 +347,7 @@ mod field_mt_tests {
         let root = tree.root();
 
         let indexes = vec![3usize, 1, 3, 1, 5];
-        let proof = tree.generate_multi_proof(indexes.clone()).unwrap();
+        let proof = tree.generate_multi_proof(indexes.clone());
         assert_eq!(
             proof.leaf_indexes,
             vec![1, 3, 5],
@@ -375,14 +361,13 @@ mod field_mt_tests {
             .collect();
 
         assert!(
-            proof
-                .verify(
-                    &leaf_crh_params,
-                    &two_to_one_params,
-                    &root,
-                    tree.height(),
-                    opened
-                ),
+            proof.verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &root,
+                tree.height(),
+                opened
+            ),
             "proof with duplicate input indices should verify after deduplication"
         );
     }
@@ -398,7 +383,7 @@ mod field_mt_tests {
         let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof(vec![1usize, 6]).unwrap();
+        let proof = tree.generate_multi_proof(vec![1usize, 6]);
         let mut bad = proof.clone();
         if let Some(first) = bad.leaf_copath.get_mut(0) {
             *first += F::one(); // flip one sibling digest
@@ -409,14 +394,13 @@ mod field_mt_tests {
             .map(|&i| leaves[i].clone())
             .collect();
 
-        let ok = bad
-            .verify(
-                &leaf_crh_params,
-                &two_to_one_params,
-                &root,
-                tree.height(),
-                opened,
-            );
+        let ok = bad.verify(
+            &leaf_crh_params,
+            &two_to_one_params,
+            &root,
+            tree.height(),
+            opened,
+        );
         assert!(!ok, "tampered leaf_copath digest must fail verification");
     }
 
@@ -431,7 +415,7 @@ mod field_mt_tests {
         let tree = FieldMT::new(&leaf_crh_params, &two_to_one_params, &leaves).unwrap();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof(vec![2usize, 5, 9]).unwrap();
+        let proof = tree.generate_multi_proof(vec![2usize, 5, 9]);
         let mut bad = proof.clone();
         if !bad.inner_copath.is_empty() {
             bad.inner_copath.pop(); // drop one inner sibling digest
@@ -441,14 +425,13 @@ mod field_mt_tests {
             .iter()
             .map(|&i| leaves[i].clone())
             .collect();
-        let ok = bad
-            .verify(
-                &leaf_crh_params,
-                &two_to_one_params,
-                &root,
-                tree.height(),
-                opened,
-            );
+        let ok = bad.verify(
+            &leaf_crh_params,
+            &two_to_one_params,
+            &root,
+            tree.height(),
+            opened,
+        );
         assert!(!ok, "missing inner copath entry must invalidate the proof");
     }
 
@@ -464,7 +447,7 @@ mod field_mt_tests {
         let root = tree.root();
 
         let indexes = vec![4usize, 1, 6];
-        let proof = tree.generate_multi_proof(indexes.clone()).unwrap();
+        let proof = tree.generate_multi_proof(indexes.clone());
 
         // verification should use leaves ordered by proof.leaf_indexes (sorted)
         let ordered_leaves: Vec<_> = proof
@@ -473,27 +456,25 @@ mod field_mt_tests {
             .map(|&i| leaves[i].clone())
             .collect();
         assert!(
-            proof
-                .verify(
-                    &leaf_crh_params,
-                    &two_to_one_params,
-                    &root,
-                    tree.height(),
-                    ordered_leaves.clone()
-                ),
+            proof.verify(
+                &leaf_crh_params,
+                &two_to_one_params,
+                &root,
+                tree.height(),
+                ordered_leaves.clone()
+            ),
             "proof should verify when leaves follow proof.leaf_indexes order"
         );
 
         // providing leaves in shuffled query order should fail
         let shuffled_leaves: Vec<_> = indexes.iter().map(|&i| leaves[i].clone()).collect();
-        let ok = proof
-            .verify(
-                &leaf_crh_params,
-                &two_to_one_params,
-                &root,
-                tree.height(),
-                shuffled_leaves,
-            );
+        let ok = proof.verify(
+            &leaf_crh_params,
+            &two_to_one_params,
+            &root,
+            tree.height(),
+            shuffled_leaves,
+        );
         assert!(!ok, "mismatched leaf ordering must fail verification");
     }
 
@@ -506,9 +487,8 @@ mod field_mt_tests {
         let root = tree.root();
 
         for i in 0..leaves.len() {
-            let proof = tree.generate_multi_proof([i]).unwrap();
-            let ok = proof
-                .verify(&params, &params, &root, tree.height(), [leaves[i].clone()]);
+            let proof = tree.generate_multi_proof([i]);
+            let ok = proof.verify(&params, &params, &root, tree.height(), [leaves[i].clone()]);
             assert!(ok, "single-leaf proof must verify for index {i}");
         }
     }
@@ -519,10 +499,9 @@ mod field_mt_tests {
         let params = poseidon_parameters();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof(0..leaves.len()).unwrap();
+        let proof = tree.generate_multi_proof(0..leaves.len());
         assert!(
-            proof
-                .verify(&params, &params, &root, tree.height(), leaves.clone()),
+            proof.verify(&params, &params, &root, tree.height(), leaves.clone()),
             "full-batch proof must verify"
         );
         // full batch: every sibling is on-path, so no inner copath elements needed
@@ -539,12 +518,15 @@ mod field_mt_tests {
         let params = poseidon_parameters();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof([3usize, 9]).unwrap();
+        let proof = tree.generate_multi_proof([3usize, 9]);
         let mut bad = proof.clone();
         bad.inner_copath.push(F::one()); // one spurious digest
-        let opened: Vec<_> = bad.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
-        let ok = bad
-            .verify(&params, &params, &root, tree.height(), opened);
+        let opened: Vec<_> = bad
+            .leaf_indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
+        let ok = bad.verify(&params, &params, &root, tree.height(), opened);
         assert!(!ok, "extra inner digest must fail verification");
     }
 
@@ -554,10 +536,13 @@ mod field_mt_tests {
         let params = poseidon_parameters();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof([0usize, 3]).unwrap();
-        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
-        let ok = proof
-            .verify(&params, &params, &root, tree.height() + 1, opened);
+        let proof = tree.generate_multi_proof([0usize, 3]);
+        let opened: Vec<_> = proof
+            .leaf_indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
+        let ok = proof.verify(&params, &params, &root, tree.height() + 1, opened);
         assert!(!ok, "mismatched tree height must fail verification");
     }
 
@@ -572,13 +557,17 @@ mod field_mt_tests {
         let params = poseidon_parameters();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof([5usize, 6]).unwrap();
+        let proof = tree.generate_multi_proof([5usize, 6]);
         assert_eq!(
             proof.inner_copath.len(),
             1,
             "siblings {{5,6}} share a parent; only one inner copath node needed"
         );
-        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        let opened: Vec<_> = proof
+            .leaf_indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
         assert!(
             proof.verify(&params, &params, &root, tree.height(), opened),
             "proof must verify"
@@ -597,13 +586,17 @@ mod field_mt_tests {
         let params = poseidon_parameters();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof([3usize, 6]).unwrap();
+        let proof = tree.generate_multi_proof([3usize, 6]);
         assert_eq!(
             proof.inner_copath.len(),
             2,
             "paths {{3,6}} share depth-1 nodes; two inner copath nodes needed at depth 2"
         );
-        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        let opened: Vec<_> = proof
+            .leaf_indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
         assert!(
             proof.verify(&params, &params, &root, tree.height(), opened),
             "proof must verify"
@@ -619,13 +612,17 @@ mod field_mt_tests {
         let params = poseidon_parameters();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof([1usize, 3, 5, 6]).unwrap();
+        let proof = tree.generate_multi_proof([1usize, 3, 5, 6]);
         assert_eq!(
             proof.inner_copath.len(),
             0,
             "I={{1,3,5,6}} covers all inner nodes; inner copath must be empty"
         );
-        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        let opened: Vec<_> = proof
+            .leaf_indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
         assert!(
             proof.verify(&params, &params, &root, tree.height(), opened),
             "proof must verify"
@@ -641,13 +638,17 @@ mod field_mt_tests {
         let params = poseidon_parameters();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof([1usize, 2, 3, 4]).unwrap();
+        let proof = tree.generate_multi_proof([1usize, 2, 3, 4]);
         assert_eq!(
             proof.inner_copath.len(),
             2,
             "contiguous subtree I={{1,2,3,4}} on T4 needs exactly 2 inner copath nodes"
         );
-        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        let opened: Vec<_> = proof
+            .leaf_indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
         assert!(
             proof.verify(&params, &params, &root, tree.height(), opened),
             "proof must verify"
@@ -662,17 +663,147 @@ mod field_mt_tests {
         let params = poseidon_parameters();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof([2usize, 7, 12, 14]).unwrap();
+        let proof = tree.generate_multi_proof([2usize, 7, 12, 14]);
         assert_eq!(
             proof.inner_copath.len(),
             3,
             "spread I={{2,7,12,14}} on T4 needs exactly 3 inner copath nodes"
         );
-        let opened: Vec<_> = proof.leaf_indexes.iter().map(|&i| leaves[i].clone()).collect();
+        let opened: Vec<_> = proof
+            .leaf_indexes
+            .iter()
+            .map(|&i| leaves[i].clone())
+            .collect();
         assert!(
             proof.verify(&params, &params, &root, tree.height(), opened),
             "proof must verify"
         );
+    }
+
+    /// Vector-commitment API: commit / open / check
+    #[test]
+    fn commit_open_check_roundtrip() {
+        let mut rng = test_rng();
+        let params = poseidon_parameters();
+        let message: Vec<Vec<F>> = (0..16)
+            .map(|_| (0..3).map(|_| F::rand(&mut rng)).collect())
+            .collect();
+
+        // Prover side: commit to the full message, then open at chosen indices.
+        let scheme = FieldMT::blank(&params, &params, 5).unwrap();
+        let committed = scheme.commit(&message).unwrap();
+        let root = committed.root();
+        let indices = vec![2usize, 5, 9, 9, 2];
+        let opening = Opening::new(
+            indices.clone(),
+            indices.iter().map(|&i| message[i].clone()).collect(),
+        );
+        let proof = committed.open(indices);
+        assert_eq!(
+            proof.leaf_indexes(),
+            vec![2, 5, 9],
+            "indexes should be sorted & deduped"
+        );
+
+        assert!(
+            scheme.check(&root, &opening, &proof),
+            "check should accept valid opening"
+        );
+    }
+
+    /// Tampering with the verifier's claimed opening leaf must fail `check`.
+    #[test]
+    fn check_rejects_tampered_opening_leaf() {
+        let mut rng = test_rng();
+        let params = poseidon_parameters();
+        let message: Vec<Vec<F>> = (0..16)
+            .map(|_| (0..3).map(|_| F::rand(&mut rng)).collect())
+            .collect();
+
+        let scheme = FieldMT::blank(&params, &params, 5).unwrap();
+        let committed = scheme.commit(&message).unwrap();
+        let root = committed.root();
+        let indices = vec![3usize, 7];
+        let proof = committed.open(indices.clone());
+
+        let mut opened: Vec<_> = indices.iter().map(|&i| message[i].clone()).collect();
+        opened[0][0] += F::one();
+        let bad_opening = Opening::new(indices, opened);
+        assert!(
+            !scheme.check(&root, &bad_opening, &proof),
+            "tampered opening leaf must fail"
+        );
+    }
+
+    #[test]
+    fn height_2_tree() {
+        let mut rng = test_rng();
+        let params = poseidon_parameters();
+        let message: Vec<Vec<F>> = (0..2)
+            .map(|_| (0..3).map(|_| F::rand(&mut rng)).collect())
+            .collect();
+
+        let scheme = FieldMT::blank(&params, &params, 2).unwrap();
+        let committed = scheme.commit(&message).unwrap();
+        let root = committed.root();
+        let proof = committed.open([1usize]);
+        let opening = Opening::new(vec![1usize], vec![message[1].clone()]);
+
+        assert!(scheme.check(&root, &opening, &proof));
+    }
+
+    #[test]
+    fn update_then_commit_open_check() {
+        let (mut tree, mut message) = make_tree(16);
+        let params = poseidon_parameters();
+        let mut rng = test_rng();
+        let new_leaf: Vec<F> = (0..3).map(|_| F::rand(&mut rng)).collect();
+
+        tree.update(4, &new_leaf).unwrap();
+        message[4] = new_leaf;
+
+        let scheme = FieldMT::blank(&params, &params, tree.height()).unwrap();
+        let committed = scheme.commit(&message).unwrap();
+        let root = tree.root();
+        let proof = committed.open([4usize, 10]);
+        let opening = Opening::new(
+            vec![4usize, 10],
+            vec![message[4].clone(), message[10].clone()],
+        );
+
+        assert!(scheme.check(&root, &opening, &proof));
+        assert_eq!(root, committed.root());
+    }
+
+    #[test]
+    fn out_of_bounds_leaf_index_in_verify_returns_false() {
+        let (tree, leaves) = make_tree(8);
+        let params = poseidon_parameters();
+        let root = tree.root();
+
+        let mut proof = tree.generate_multi_proof([2usize]);
+        proof.leaf_indexes[0] = 8;
+
+        let ok = proof.verify(&params, &params, &root, tree.height(), [leaves[2].clone()]);
+        assert!(!ok, "OOB leaf indexes must fail instead of panicking");
+    }
+
+    /// expand then compress should round-trip back to the original CoPath.
+    #[test]
+    fn copath_expand_compress_roundtrip() {
+        let (tree, leaves) = make_tree(16);
+        let params = poseidon_parameters();
+        let scheme = FieldMT::blank(&params, &params, tree.height()).unwrap();
+        let committed = scheme.commit(&leaves).unwrap();
+
+        let proof = committed.open([2usize, 5, 9]);
+        let expanded = proof.expand(&committed);
+        let recompressed = expanded.compress();
+
+        assert_eq!(proof.copath.leaf_indexes, recompressed.copath.leaf_indexes);
+        assert_eq!(proof.copath.leaf_copath, recompressed.copath.leaf_copath);
+        assert_eq!(proof.copath.inner_copath, recompressed.copath.inner_copath);
+        assert_eq!(proof.copath.tree_height, recompressed.copath.tree_height);
     }
 
     /// Opening all leaves: every sibling is on-path, so the inner copath is empty.
@@ -682,7 +813,7 @@ mod field_mt_tests {
         let params = poseidon_parameters();
         let root = tree.root();
 
-        let proof = tree.generate_multi_proof(0..leaves.len()).unwrap();
+        let proof = tree.generate_multi_proof(0..leaves.len());
         assert!(
             proof.inner_copath.is_empty(),
             "opening all leaves: inner copath must be empty"

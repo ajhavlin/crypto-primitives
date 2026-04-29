@@ -12,7 +12,6 @@ mod bytes_mt_benches {
     use ark_std::{test_rng, UniformRand};
     use criterion::Criterion;
     use std::borrow::Borrow;
-    use std::iter::zip;
 
     use crate::NUM_LEAVES;
 
@@ -57,7 +56,7 @@ mod bytes_mt_benches {
         });
     }
 
-    pub fn merkle_tree_generate_proof(c: &mut Criterion) {
+    pub fn merkle_tree_generate_single_opening(c: &mut Criterion) {
         let mut rng = test_rng();
         let leaves: Vec<_> = (0..NUM_LEAVES)
             .map(|_| {
@@ -70,22 +69,27 @@ mod bytes_mt_benches {
             .unwrap()
             .clone();
 
-        let tree = Sha256MerkleTree::new(
+        let tree_height = leaves.len().trailing_zeros() as usize + 1;
+        let scheme = Sha256MerkleTree::blank(
             &leaf_crh_params.clone(),
             &two_to_one_params.clone(),
-            &leaves,
+            tree_height,
         )
         .unwrap();
-        c.bench_function("Merkle Tree Generate Proof (Leaves as [u8])", move |b| {
-            b.iter(|| {
-                for (i, _) in leaves.iter().enumerate() {
-                    tree.generate_proof(i).unwrap();
-                }
-            })
-        });
+        let committed = scheme.commit(&leaves).unwrap();
+        c.bench_function(
+            "Merkle Tree Generate Single Opening (Leaves as [u8])",
+            move |b| {
+                b.iter(|| {
+                    for (i, _) in leaves.iter().enumerate() {
+                        committed.open([i]);
+                    }
+                })
+            },
+        );
     }
 
-    pub fn merkle_tree_verify_proof(c: &mut Criterion) {
+    pub fn merkle_tree_verify_single_opening(c: &mut Criterion) {
         let mut rng = test_rng();
         let leaves: Vec<_> = (0..NUM_LEAVES)
             .map(|_| {
@@ -98,28 +102,36 @@ mod bytes_mt_benches {
             .unwrap()
             .clone();
 
-        let tree = Sha256MerkleTree::new(
+        let tree_height = leaves.len().trailing_zeros() as usize + 1;
+        let scheme = Sha256MerkleTree::blank(
             &leaf_crh_params.clone(),
             &two_to_one_params.clone(),
-            &leaves,
+            tree_height,
         )
         .unwrap();
-
-        let root = tree.root();
-
-        let proofs: Vec<_> = leaves
+        let committed = scheme.commit(&leaves).unwrap();
+        let root = committed.root();
+        let openings_and_proofs: Vec<_> = leaves
             .iter()
             .enumerate()
-            .map(|(i, _)| tree.generate_proof(i).unwrap())
+            .map(|(i, leaf)| {
+                (
+                    Opening::new(vec![i], vec![leaf.clone()]),
+                    committed.open([i]),
+                )
+            })
             .collect();
 
-        c.bench_function("Merkle Tree Verify Proof (Leaves as [u8])", move |b| {
-            b.iter(|| {
-                for (proof, leaf) in zip(proofs.clone(), leaves.clone()) {
-                    proof.verify(&leaf_crh_params, &two_to_one_params, &root, leaf.as_slice());
-                }
-            })
-        });
+        c.bench_function(
+            "Merkle Tree Verify Single Opening (Leaves as [u8])",
+            move |b| {
+                b.iter(|| {
+                    for (opening, proof) in &openings_and_proofs {
+                        scheme.check(&root, opening, proof);
+                    }
+                })
+            },
+        );
     }
 
     pub fn merkle_tree_generate_multi_proof(c: &mut Criterion) {
@@ -135,18 +147,19 @@ mod bytes_mt_benches {
             .unwrap()
             .clone();
 
-        let tree = Sha256MerkleTree::new(
+        let tree_height = leaves.len().trailing_zeros() as usize + 1;
+        let scheme = Sha256MerkleTree::blank(
             &leaf_crh_params.clone(),
             &two_to_one_params.clone(),
-            &leaves,
+            tree_height,
         )
         .unwrap();
+        let committed = scheme.commit(&leaves).unwrap();
         c.bench_function(
             "Merkle Tree Generate Multi Proof (Leaves as [u8])",
             move |b| {
                 b.iter(|| {
-                    tree.generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
-                        .unwrap();
+                    committed.open(0..leaves.len());
                 })
             },
         );
@@ -165,33 +178,23 @@ mod bytes_mt_benches {
             .unwrap()
             .clone();
 
-        let tree = Sha256MerkleTree::new(
+        let tree_height = leaves.len().trailing_zeros() as usize + 1;
+        let scheme = Sha256MerkleTree::blank(
             &leaf_crh_params.clone(),
             &two_to_one_params.clone(),
-            &leaves,
+            tree_height,
         )
         .unwrap();
 
-        let root = tree.root();
-        let tree_height = tree.height();
-
-        let multi_proof = tree
-            .generate_multi_proof((0..leaves.len()).collect::<Vec<_>>())
-            .unwrap();
+        let committed = scheme.commit(&leaves).unwrap();
+        let root = committed.root();
+        let indices: Vec<_> = (0..leaves.len()).collect();
+        let opening = Opening::new(indices.clone(), leaves.clone());
+        let multi_proof = committed.open(indices);
 
         c.bench_function(
             "Merkle Tree Verify Multi Proof (Leaves as [u8])",
-            move |b| {
-                b.iter(|| {
-                    multi_proof.verify(
-                        &leaf_crh_params,
-                        &two_to_one_params,
-                        &root,
-                        tree_height,
-                        leaves.clone(),
-                    )
-                })
-            },
+            move |b| b.iter(|| scheme.check(&root, &opening, &multi_proof)),
         );
     }
 
@@ -204,13 +207,13 @@ mod bytes_mt_benches {
     criterion_group! {
         name = mt_proof;
         config = Criterion::default().sample_size(100);
-        targets = merkle_tree_generate_proof, merkle_tree_generate_multi_proof
+        targets = merkle_tree_generate_single_opening, merkle_tree_generate_multi_proof
     }
 
     criterion_group! {
         name = mt_verify;
         config = Criterion::default().sample_size(10);
-        targets = merkle_tree_verify_proof, merkle_tree_verify_multi_proof
+        targets = merkle_tree_verify_single_opening, merkle_tree_verify_multi_proof
     }
 }
 

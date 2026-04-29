@@ -4,13 +4,14 @@
 
 ### Breaking changes
 
-- [\#](https://github.com/arkworks-rs/crypto-primitives/pull/X) Replace the prefix-encoded `MultiPath` Merkle multiproof with a CoSet-based `CoPath` representation and update `MerkleTree::generate_multi_proof` to return `CoPath`. This changes the proof encoding for batch openings and removes the old `MultiPath` type from the public API.
+- [\#](https://github.com/arkworks-rs/crypto-primitives/pull/173) Replace the prefix-encoded `MultiPath` Merkle multiproof with a CoSet-based proof representation behind the public `Committed::open` / `Opening` / `MerkleTree::check` API. This changes the proof encoding for batch openings and removes the old `MultiPath` type from the public API.
+- [\#](https://github.com/arkworks-rs/crypto-primitives/pull/173) Remove the deprecated Merkle tree `Path` / `PathVar` constraints API in favor of the public vector-commitment opening API.
 
 ### Features
 
 ### Improvements
 
-- [\#](https://github.com/arkworks-rs/crypto-primitives/pull/X) Implement CoSet (minimal copath) pruning for Merkle multiproofs, reducing proof size and redundant hashing in batched openings.
+- [\#](https://github.com/arkworks-rs/crypto-primitives/pull/173) Implement CoSet (minimal copath) pruning for Merkle multiproofs, reducing proof size and redundant hashing in batched openings.
 
 ### Bugfixes
 
