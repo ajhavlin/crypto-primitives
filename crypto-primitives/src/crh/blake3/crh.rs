@@ -7,7 +7,10 @@ use core::marker::PhantomData;
 use ark_std::vec::Vec;
 
 use crate::{
-    crh::{ByteDigest, CRHScheme, TwoToOneCRHScheme},
+    crh::{
+        byte_digest::{INNER_TAG, LEAF_PAIR_TAG},
+        ByteDigest, CRHScheme, TwoToOneCRHScheme,
+    },
     Error,
 };
 
@@ -57,17 +60,22 @@ impl TwoToOneCRHScheme for Blake3TwoToOneCRH {
         right_input: T,
     ) -> Result<Self::Output, Error> {
         let mut hasher = blake3::Hasher::new();
+        hasher.update(LEAF_PAIR_TAG);
         hasher.update(&left_input.borrow().0);
         hasher.update(&right_input.borrow().0);
         Ok(ByteDigest(*hasher.finalize().as_bytes()))
     }
 
     fn compress<T: Borrow<Self::Output>>(
-        parameters: &Self::Parameters,
+        (): &Self::Parameters,
         left_input: T,
         right_input: T,
     ) -> Result<Self::Output, Error> {
-        Self::evaluate(parameters, left_input, right_input)
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(INNER_TAG);
+        hasher.update(&left_input.borrow().0);
+        hasher.update(&right_input.borrow().0);
+        Ok(ByteDigest(*hasher.finalize().as_bytes()))
     }
 }
 
@@ -114,13 +122,13 @@ mod tests {
     }
 
     #[test]
-    fn blake3_compress_matches_evaluate() {
+    fn blake3_evaluate_ne_compress() {
         let params = Blake3TwoToOneCRH::setup(&mut test_rng()).unwrap();
         let left = ByteDigest([0xAA; 32]);
         let right = ByteDigest([0xBB; 32]);
 
         let eval = Blake3TwoToOneCRH::evaluate(&params, &left, &right).unwrap();
         let comp = Blake3TwoToOneCRH::compress(&params, &left, &right).unwrap();
-        assert_eq!(eval, comp);
+        assert_ne!(eval, comp, "evaluate and compress must be domain-separated");
     }
 }

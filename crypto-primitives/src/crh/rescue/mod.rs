@@ -72,7 +72,12 @@ impl<F: PrimeField + Absorb> TwoToOneCRHScheme for TwoToOneCRH<F> {
         left_input: T,
         right_input: T,
     ) -> Result<Self::Output, Error> {
-        <Self as TwoToOneCRHScheme>::compress(parameters, left_input, right_input)
+        let mut sponge = RescueSponge::new(parameters);
+        sponge.absorb(&F::one());
+        sponge.absorb(left_input.borrow());
+        sponge.absorb(right_input.borrow());
+        let res = sponge.squeeze_field_elements::<F>(1);
+        Ok(res[0])
     }
 
     /// Compress the inputs left and right using the Rescue sponge.
@@ -81,12 +86,9 @@ impl<F: PrimeField + Absorb> TwoToOneCRHScheme for TwoToOneCRH<F> {
         left_input: T,
         right_input: T,
     ) -> Result<Self::Output, Error> {
-        let left_input = left_input.borrow();
-        let right_input = right_input.borrow();
-
         let mut sponge = RescueSponge::new(parameters);
-        sponge.absorb(left_input);
-        sponge.absorb(right_input);
+        sponge.absorb(left_input.borrow());
+        sponge.absorb(right_input.borrow());
         let res = sponge.squeeze_field_elements::<F>(1);
         Ok(res[0])
     }
@@ -104,7 +106,12 @@ impl<F: PrimeField + Absorb> FieldTwoToOneCRHScheme<F> for TwoToOneCRH<F> {
         left_input: F,
         right_input: F,
     ) -> Result<F, Error> {
-        <Self as FieldTwoToOneCRHScheme<F>>::compress(parameters, left_input, right_input)
+        let mut sponge = RescueSponge::new(parameters);
+        sponge.absorb(&F::one());
+        sponge.absorb(&left_input);
+        sponge.absorb(&right_input);
+        let res: Vec<F> = sponge.squeeze_field_elements::<F>(1);
+        Ok(res[0])
     }
 
     fn compress(

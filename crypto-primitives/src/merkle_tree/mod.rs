@@ -988,24 +988,3 @@ pub(super) fn compute_on_path(
     path_sets
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-mod field_tree_helpers {
-    use super::*;
-
-    /// Placeholder for the Phase 2 field-native single-path verifier.
-    /// Activated once `verify_and_hash_bottom_layer` and `Path::verify` gain field-specialized
-    /// paths that skip [`LeafInnerDigestConverter`] entirely.
-    pub(crate) fn verify_field_tree<F, P>(
-        _leaf_digest: F,
-        _path: &Path<P>,
-        _parameters: &TwoToOneParam<P>,
-    ) -> Result<bool, Error>
-    where
-        F: Field + Absorb,
-        P: FieldMerkleTreeConfig<F>,
-        P::TwoToOneHash: FieldTwoToOneCRHScheme<F>,
-    {
-        todo!("activated in Phase 2")
-    }
-}

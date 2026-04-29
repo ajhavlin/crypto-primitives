@@ -1,5 +1,8 @@
 use crate::{
-    crh::{CRHScheme, TwoToOneCRHScheme},
+    crh::{
+        byte_digest::{INNER_TAG, LEAF_PAIR_TAG},
+        CRHScheme, TwoToOneCRHScheme,
+    },
     Error,
 };
 #[cfg(not(feature = "std"))]
@@ -47,32 +50,29 @@ impl TwoToOneCRHScheme for Sha256 {
         Ok(())
     }
 
-    // Evaluates SHA256(left_input || right_input)
+    // Evaluates SHA256(LEAF_PAIR_TAG || left_input || right_input)
     fn evaluate<T: Borrow<Self::Input>>(
         _parameters: &Self::Parameters,
         left_input: T,
         right_input: T,
     ) -> Result<Self::Output, Error> {
-        let left_input = left_input.borrow();
-        let right_input = right_input.borrow();
-
-        // Process the left input then the right input
         let mut h = Sha256::default();
-        h.update(left_input);
-        h.update(right_input);
+        h.update(LEAF_PAIR_TAG);
+        h.update(left_input.borrow());
+        h.update(right_input.borrow());
         Ok(h.finalize().to_vec())
     }
 
-    // Evaluates SHA256(left_input || right_input)
+    // Evaluates SHA256(INNER_TAG || left_input || right_input)
     fn compress<T: Borrow<Self::Output>>(
-        parameters: &Self::Parameters,
+        _parameters: &Self::Parameters,
         left_input: T,
         right_input: T,
     ) -> Result<Self::Output, Error> {
-        <Self as TwoToOneCRHScheme>::evaluate(
-            parameters,
-            left_input.borrow().as_slice(),
-            right_input.borrow().as_slice(),
-        )
+        let mut h = Sha256::default();
+        h.update(INNER_TAG);
+        h.update(left_input.borrow().as_slice());
+        h.update(right_input.borrow().as_slice());
+        Ok(h.finalize().to_vec())
     }
 }
